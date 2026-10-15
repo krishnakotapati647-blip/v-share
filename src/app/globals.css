@@ -1,26 +1,332 @@
 @import "tailwindcss";
 
+/* ============================================
+   VIDELINK Design System
+   ============================================ */
+
+/* --- CSS Custom Properties (Light Theme) --- */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --vl-bg-primary: #fafbfc;
+  --vl-bg-secondary: #f1f3f5;
+  --vl-bg-card: #ffffff;
+  --vl-bg-elevated: #ffffff;
+  --vl-bg-overlay: rgba(0, 0, 0, 0.4);
+
+  --vl-text-primary: #1a1d21;
+  --vl-text-secondary: #5e6368;
+  --vl-text-tertiary: #8b9099;
+  --vl-text-inverse: #ffffff;
+
+  --vl-border-default: #e2e5e9;
+  --vl-border-subtle: #eef0f2;
+  --vl-border-strong: #c8ccd1;
+
+  --vl-accent: #6366f1;
+  --vl-accent-hover: #5558e6;
+  --vl-accent-subtle: #eef2ff;
+  --vl-accent-text: #4f46e5;
+
+  --vl-success: #10b981;
+  --vl-success-subtle: #ecfdf5;
+  --vl-warning: #f59e0b;
+  --vl-warning-subtle: #fffbeb;
+  --vl-error: #ef4444;
+  --vl-error-subtle: #fef2f2;
+
+  --vl-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --vl-shadow-md: 0 2px 8px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --vl-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04);
+  --vl-shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.1), 0 4px 12px rgba(0, 0, 0, 0.05);
+
+  --vl-radius-sm: 6px;
+  --vl-radius-md: 10px;
+  --vl-radius-lg: 14px;
+  --vl-radius-xl: 20px;
+  --vl-radius-full: 9999px;
+
+  --background: var(--vl-bg-primary);
+  --foreground: var(--vl-text-primary);
 }
 
+/* --- Dark Theme --- */
+[data-theme="dark"] {
+  --vl-bg-primary: #0c0d10;
+  --vl-bg-secondary: #141519;
+  --vl-bg-card: #1a1b20;
+  --vl-bg-elevated: #222329;
+  --vl-bg-overlay: rgba(0, 0, 0, 0.6);
+
+  --vl-text-primary: #f0f1f3;
+  --vl-text-secondary: #a1a5ac;
+  --vl-text-tertiary: #6b7078;
+  --vl-text-inverse: #1a1d21;
+
+  --vl-border-default: #2a2c33;
+  --vl-border-subtle: #1f2128;
+  --vl-border-strong: #3a3d45;
+
+  --vl-accent: #818cf8;
+  --vl-accent-hover: #9ba3fb;
+  --vl-accent-subtle: rgba(129, 140, 248, 0.1);
+  --vl-accent-text: #a5b4fc;
+
+  --vl-success: #34d399;
+  --vl-success-subtle: rgba(16, 185, 129, 0.1);
+  --vl-warning: #fbbf24;
+  --vl-warning-subtle: rgba(245, 158, 11, 0.1);
+  --vl-error: #f87171;
+  --vl-error-subtle: rgba(239, 68, 68, 0.1);
+
+  --vl-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --vl-shadow-md: 0 2px 8px rgba(0, 0, 0, 0.25), 0 1px 2px rgba(0, 0, 0, 0.2);
+  --vl-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.3), 0 2px 8px rgba(0, 0, 0, 0.2);
+  --vl-shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.35), 0 4px 12px rgba(0, 0, 0, 0.2);
+
+  --background: var(--vl-bg-primary);
+  --foreground: var(--vl-text-primary);
+}
+
+/* --- Tailwind Theme Integration --- */
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+
+  --color-vl-bg-primary: var(--vl-bg-primary);
+  --color-vl-bg-secondary: var(--vl-bg-secondary);
+  --color-vl-bg-card: var(--vl-bg-card);
+  --color-vl-bg-elevated: var(--vl-bg-elevated);
+
+  --color-vl-text-primary: var(--vl-text-primary);
+  --color-vl-text-secondary: var(--vl-text-secondary);
+  --color-vl-text-tertiary: var(--vl-text-tertiary);
+
+  --color-vl-border: var(--vl-border-default);
+  --color-vl-border-subtle: var(--vl-border-subtle);
+  --color-vl-border-strong: var(--vl-border-strong);
+
+  --color-vl-accent: var(--vl-accent);
+  --color-vl-accent-hover: var(--vl-accent-hover);
+  --color-vl-accent-subtle: var(--vl-accent-subtle);
+  --color-vl-accent-text: var(--vl-accent-text);
+
+  --color-vl-success: var(--vl-success);
+  --color-vl-success-subtle: var(--vl-success-subtle);
+  --color-vl-warning: var(--vl-warning);
+  --color-vl-warning-subtle: var(--vl-warning-subtle);
+  --color-vl-error: var(--vl-error);
+  --color-vl-error-subtle: var(--vl-error-subtle);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
+/* --- Base Styles --- */
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* --- Focus Visible --- */
+:focus-visible {
+  outline: 2px solid var(--vl-accent);
+  outline-offset: 2px;
+  border-radius: var(--vl-radius-sm);
+}
+
+/* --- Reduced Motion --- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* --- Scrollbar Styling --- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--vl-border-strong);
+  border-radius: var(--vl-radius-full);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vl-text-tertiary);
+}
+
+/* --- Selection --- */
+::selection {
+  background: var(--vl-accent);
+  color: white;
+}
+
+/* --- Utility Classes --- */
+.vl-container {
+  width: 100%;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+.vl-card {
+  background: var(--vl-bg-card);
+  border: 1px solid var(--vl-border-default);
+  border-radius: var(--vl-radius-lg);
+  box-shadow: var(--vl-shadow-sm);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.vl-card:hover {
+  box-shadow: var(--vl-shadow-md);
+}
+
+.vl-gradient-text {
+  background: linear-gradient(135deg, var(--vl-accent), #a78bfa, #f472b6);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.vl-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1.5rem;
+  background: var(--vl-accent);
+  color: white;
+  font-weight: 600;
+  font-size: 0.9375rem;
+  border-radius: var(--vl-radius-md);
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
+  box-shadow: 0 1px 3px rgba(99, 102, 241, 0.3);
+}
+
+.vl-btn-primary:hover {
+  background: var(--vl-accent-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.35);
+}
+
+.vl-btn-primary:active {
+  transform: translateY(0);
+}
+
+.vl-btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1.5rem;
+  background: transparent;
+  color: var(--vl-text-primary);
+  font-weight: 600;
+  font-size: 0.9375rem;
+  border-radius: var(--vl-radius-md);
+  border: 1px solid var(--vl-border-default);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+
+.vl-btn-secondary:hover {
+  background: var(--vl-bg-secondary);
+  border-color: var(--vl-border-strong);
+  transform: translateY(-1px);
+}
+
+.vl-btn-secondary:active {
+  transform: translateY(0);
+}
+
+/* --- Progress Bar --- */
+.vl-progress-bar {
+  height: 6px;
+  background: var(--vl-bg-secondary);
+  border-radius: var(--vl-radius-full);
+  overflow: hidden;
+}
+
+.vl-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--vl-accent), #818cf8);
+  border-radius: var(--vl-radius-full);
+  transition: width 0.3s ease;
+}
+
+/* --- Input --- */
+.vl-input {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  background: var(--vl-bg-card);
+  border: 1px solid var(--vl-border-default);
+  border-radius: var(--vl-radius-md);
+  color: var(--vl-text-primary);
+  font-size: 0.9375rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.vl-input:focus {
+  border-color: var(--vl-accent);
+  box-shadow: 0 0 0 3px var(--vl-accent-subtle);
+  outline: none;
+}
+
+.vl-input::placeholder {
+  color: var(--vl-text-tertiary);
+}
+
+/* --- Animations --- */
+@keyframes vl-fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes vl-slide-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes vl-pulse-subtle {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.vl-animate-in {
+  animation: vl-fade-in 0.4s ease-out forwards;
+}
+
+.vl-animate-slide-up {
+  animation: vl-slide-up 0.5s ease-out forwards;
+}
+
+/* --- Drop Zone --- */
+.vl-dropzone {
+  border: 2px dashed var(--vl-border-default);
+  border-radius: var(--vl-radius-lg);
+  padding: 3rem;
+  text-align: center;
+  transition: border-color 0.2s ease, background 0.2s ease;
+  cursor: pointer;
+}
+
+.vl-dropzone:hover,
+.vl-dropzone.active {
+  border-color: var(--vl-accent);
+  background: var(--vl-accent-subtle);
+}
+
+.vl-dropzone.drag-over {
+  border-color: var(--vl-accent);
+  background: var(--vl-accent-subtle);
+  border-style: solid;
 }
