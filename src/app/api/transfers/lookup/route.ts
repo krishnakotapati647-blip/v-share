@@ -52,7 +52,8 @@ export async function POST(req: NextRequest) {
     }
 
     // Check upload status
-    if (transfer.uploadStatus !== "completed") {
+    const isP2P = transfer.uploadStatus === "p2p_waiting" || transfer.uploadStatus === "p2p_streaming";
+    if (transfer.uploadStatus !== "completed" && !isP2P) {
       return NextResponse.json(
         { error: "This video transfer is still uploading or was abandoned." },
         { status: 400 }
@@ -97,6 +98,7 @@ export async function POST(req: NextRequest) {
     await createTransferEvent(transfer.id, "transfer_viewed", {}, ipHash);
 
     const publicInfo: TransferPublicInfo = {
+      id: transfer.id,
       code: transfer.displayCode,
       originalFilename: transfer.originalFilename,
       fileSize: transfer.fileSize,
@@ -113,6 +115,7 @@ export async function POST(req: NextRequest) {
       downloadCount: transfer.downloadCount,
       passwordRequired: !!transfer.passwordHash,
       uploadStatus: transfer.uploadStatus as any,
+      isP2P,
     };
 
     return NextResponse.json({ transfer: publicInfo });

@@ -57,6 +57,43 @@ export async function POST(req: NextRequest) {
       passwordHash = await hashPassword(data.password.trim());
     }
 
+    const isP2P = data.isP2P !== false && data.transferMode !== "cloud";
+
+    if (isP2P) {
+      const transfer = await createTransfer({
+        codeLookupHash,
+        displayCode,
+        originalFilename: sanitizedFilename,
+        objectKey: "p2p://direct",
+        fileSize: data.fileSize,
+        contentType: data.contentType,
+        checksumAlgorithm: data.checksumAlgorithm,
+        integrityStatus: "verified",
+        uploadStatus: "p2p_waiting",
+        passwordHash,
+        senderMessage: data.senderMessage,
+        allowPreview: data.allowPreview,
+        allowOriginalDownload: data.allowOriginalDownload,
+        downloadLimit: data.downloadLimit,
+        expiresAt,
+      });
+
+      await createTransferEvent(transfer.id, "p2p_session_created", {
+        originalFilename: sanitizedFilename,
+        fileSize: data.fileSize,
+      });
+
+      return NextResponse.json(
+        {
+          transferId: transfer.id,
+          code: displayCode,
+          isP2P: true,
+          expiresAt: expiresAt.toISOString(),
+        },
+        { status: 201 }
+      );
+    }
+
     // Temporary ID for key generation
     const tempTransferId = `tr_${Date.now()}`;
     const objectKey = generateObjectKey(tempTransferId, sanitizedFilename);

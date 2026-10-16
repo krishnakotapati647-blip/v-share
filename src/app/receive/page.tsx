@@ -4,10 +4,12 @@ import { useState, useCallback, useRef, useEffect, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import {
   formatFileSize,
+  formatSpeed,
   normalizeTransferCode,
   TRANSFER_CODE_REGEX,
   type TransferPublicInfo,
 } from "@/lib/types";
+import { P2PReceiverSession, type P2PProgress, type P2PStatus } from "@/lib/webrtc";
 
 type ReceiveStep = "input" | "loading" | "password" | "details" | "error";
 
@@ -23,6 +25,25 @@ function ReceivePageContent() {
   const [events, setEvents] = useState<{ id: string; eventType: string; createdAt: string; metadata?: any }[] | null>(null);
   const [loadingEvents, setLoadingEvents] = useState(false);
   const [showPassport, setShowPassport] = useState(false);
+
+  // P2P Streaming states
+  const [p2pStatus, setP2pStatus] = useState<P2PStatus | null>(null);
+  const [p2pStatusMsg, setP2pStatusMsg] = useState<string>("");
+  const [p2pProgress, setP2pProgress] = useState<P2PProgress>({
+    bytesTransferred: 0,
+    totalBytes: 0,
+    percentage: 0,
+    speed: 0,
+    eta: 0,
+  });
+  const [p2pComplete, setP2pComplete] = useState(false);
+  const p2pReceiverRef = useRef<P2PReceiverSession | null>(null);
+
+  useEffect(() => {
+    return () => {
+      p2pReceiverRef.current?.destroy();
+    };
+  }, []);
 
   // Pre-fill code from URL query
   useEffect(() => {
@@ -110,6 +131,35 @@ function ReceivePageContent() {
   // ===== Download Original =====
   const downloadOriginal = useCallback(async () => {
     if (!transfer) return;
+
+    if (transfer.isP2P) {
+      if (!transfer.id) {
+        alert("Transfer session ID is missing.");
+        return;
+      }
+      setP2pStatus("initializing");
+      setP2pStatusMsg("Connecting directly to sender's browser...");
+
+      const p2p = new P2PReceiverSession(transfer.id);
+      p2pReceiverRef.current = p2p;
+
+      p2p.onStatusChange = (status, msg) => {
+        setP2pStatus(status);
+        if (msg) setP2pStatusMsg(msg);
+      };
+
+      p2p.onProgress = (prog) => {
+        setP2pProgress(prog);
+      };
+
+      p2p.onFileReceived = () => {
+        setP2pComplete(true);
+      };
+
+      p2p.start();
+      return;
+    }
+
     setDownloading(true);
     try {
       const res = await fetch("/api/transfers/download", {
@@ -384,12 +434,91 @@ function ReceivePageContent() {
                 </div>
               )}
 
+              {/* P2P Live Streaming Progress Card */}
+              {p2pStatus && (
+                <div
+                  className="rounded-2xl p-5 mb-6 border animate-in fade-in duration-300"
+                  style={{
+                    background:
+                      p2pComplete
+                        ? "rgba(16, 185, 129, 0.08)"
+                        : p2pStatus === "streaming"
+                        ? "rgba(99, 102, 241, 0.08)"
+                        : "var(--vl-bg-secondary)",
+                    borderColor:
+                      p2pComplete
+                        ? "var(--vl-success)"
+                        : p2pStatus === "streaming"
+                        ? "var(--vl-accent)"
+                        : "var(--vl-border-default)",
+                  }}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2.5">
+                      <span className="relative flex h-3 w-3">
+                        <span
+                          className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
+                            p2pComplete
+                              ? "bg-emerald-400"
+                              : p2pStatus === "streaming"
+                              ? "bg-indigo-400"
+                              : "bg-amber-400"
+                          }`}
+                        />
+                        <span
+                          className={`relative inline-flex rounded-full h-3 w-3 ${
+                            p2pComplete
+                              ? "bg-emerald-500"
+                              : p2pStatus === "streaming"
+                              ? "bg-indigo-500"
+                              : "bg-amber-500"
+                          }`}
+                        />
+                      </span>
+                      <span className="font-semibold text-sm" style={{ color: "var(--vl-text-primary)" }}>
+                        {p2pComplete
+                          ? "Download Complete!"
+                          : p2pStatus === "streaming"
+                          ? "Streaming Video Directly from Sender..."
+                          : p2pStatusMsg || "Connecting to Sender..."}
+                      </span>
+                    </div>
+
+                    <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-[var(--vl-accent-subtle)] text-[var(--vl-accent)] font-semibold">
+                      WebRTC P2P
+                    </span>
+                  </div>
+
+                  {p2pStatus === "streaming" && (
+                    <div className="space-y-2 mt-3">
+                      <div className="vl-progress-bar">
+                        <div className="vl-progress-fill" style={{ width: `${p2pProgress.percentage}%` }} />
+                      </div>
+                      <div className="flex items-center justify-between text-xs font-mono" style={{ color: "var(--vl-text-secondary)" }}>
+                        <span>
+                          {formatFileSize(p2pProgress.bytesTransferred)} / {formatFileSize(p2pProgress.totalBytes)} ({p2pProgress.percentage}%)
+                        </span>
+                        <span>
+                          ⚡ {formatSpeed(p2pProgress.speed)} · {p2pProgress.eta > 0 ? `${Math.round(p2pProgress.eta)}s remaining` : "finishing"}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {p2pComplete && (
+                    <p className="text-xs mt-2" style={{ color: "var(--vl-success)" }}>
+                      🎉 Video has been saved directly to your computer in 100% original quality!
+                    </p>
+                  )}
+                </div>
+              )}
+
               {/* Actions */}
               <div className="flex flex-col sm:flex-row gap-3">
-                {transfer.allowPreview && isPlayableInBrowser(transfer.contentType) && (
+                {transfer.allowPreview && !transfer.isP2P && isPlayableInBrowser(transfer.contentType) && (
                   <button
                     onClick={() => {
-                      // Open video player (we'll implement inline)
+                      // Open video player
                       window.open(`/watch/${encodeURIComponent(transfer.code)}${password ? `?p=${encodeURIComponent(password)}` : ""}`, "_blank");
                     }}
                     className="vl-btn-secondary flex-1 py-3.5"
@@ -405,14 +534,42 @@ function ReceivePageContent() {
                   <button
                     onClick={downloadOriginal}
                     className="vl-btn-primary flex-1 py-3.5"
-                    disabled={downloading}
+                    disabled={downloading || p2pStatus === "streaming" || p2pStatus === "initializing" || p2pComplete}
                   >
-                    {downloading ? (
+                    {p2pStatus === "streaming" ? (
+                      <>
+                        <svg className="animate-spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M21 12a9 9 0 11-6.219-8.56" />
+                        </svg>
+                        ⚡ Streaming ({p2pProgress.percentage}%)
+                      </>
+                    ) : p2pStatus === "initializing" || p2pStatus === "connecting" ? (
+                      <>
+                        <svg className="animate-spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M21 12a9 9 0 11-6.219-8.56" />
+                        </svg>
+                        Connecting to Sender...
+                      </>
+                    ) : p2pComplete ? (
+                      <>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="20 6 9 17 4 12" />
+                        </svg>
+                        Downloaded Successfully
+                      </>
+                    ) : downloading ? (
                       <>
                         <svg className="animate-spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                           <path d="M21 12a9 9 0 11-6.219-8.56" />
                         </svg>
                         Preparing...
+                      </>
+                    ) : transfer.isP2P ? (
+                      <>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                        </svg>
+                        Start Direct P2P Download
                       </>
                     ) : (
                       <>

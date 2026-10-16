@@ -46,7 +46,7 @@ export const ALLOWED_EXTENSIONS = [
 ] as const;
 
 export const MAX_FILE_SIZE_BYTES = parseInt(
-  process.env.MAX_FILE_SIZE_BYTES || "5368709120", // 5 GB
+  process.env.MAX_FILE_SIZE_BYTES || "53687091200", // 50 GB for P2P
   10
 );
 
@@ -80,6 +80,8 @@ export const createTransferSchema = z.object({
   allowPreview: z.boolean().default(true),
   allowOriginalDownload: z.boolean().default(true),
   checksumAlgorithm: z.literal("SHA-256").default("SHA-256"),
+  isP2P: z.boolean().default(true),
+  transferMode: z.enum(["p2p", "cloud"]).default("p2p"),
 });
 
 export type CreateTransferInput = z.infer<typeof createTransferSchema>;
@@ -113,7 +115,15 @@ export interface UploadSessionInfo {
 // ===================================
 // Transfer Status
 // ===================================
-export type UploadStatus = "pending" | "uploading" | "finalizing" | "completed" | "failed" | "abandoned";
+export type UploadStatus =
+  | "pending"
+  | "uploading"
+  | "finalizing"
+  | "completed"
+  | "failed"
+  | "abandoned"
+  | "p2p_waiting"
+  | "p2p_streaming";
 export type IntegrityStatus = "pending" | "verified" | "failed";
 export type TransferStatus = "active" | "expired" | "deleted";
 
@@ -121,6 +131,7 @@ export type TransferStatus = "active" | "expired" | "deleted";
 // API Response Types
 // ===================================
 export interface TransferPublicInfo {
+  id?: string;
   code: string;
   originalFilename: string;
   fileSize: number;
@@ -137,6 +148,7 @@ export interface TransferPublicInfo {
   downloadCount: number;
   passwordRequired: boolean;
   uploadStatus: UploadStatus;
+  isP2P?: boolean;
 }
 
 export interface TransferCreatedResponse {

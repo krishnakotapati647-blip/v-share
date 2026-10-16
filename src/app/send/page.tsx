@@ -14,6 +14,7 @@ import {
   type CreateTransferInput,
 } from "@/lib/types";
 import QRCode from "qrcode";
+import { P2PSenderSession, type P2PProgress, type P2PStatus } from "@/lib/webrtc";
 
 // ===== Types =====
 type SendStep = "select" | "settings" | "uploading" | "complete";
@@ -51,6 +52,18 @@ export default function SendPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Settings state
+  const [transferMode, setTransferMode] = useState<"p2p" | "cloud">("p2p");
+  const [p2pStatus, setP2pStatus] = useState<P2PStatus>("waiting_for_peer");
+  const [p2pStatusMsg, setP2pStatusMsg] = useState("Waiting for recipient to enter code...");
+  const [p2pProgress, setP2pProgress] = useState<P2PProgress>({
+    bytesTransferred: 0,
+    totalBytes: 0,
+    percentage: 0,
+    speed: 0,
+    eta: 0,
+  });
+  const p2pSessionRef = useRef<P2PSenderSession | null>(null);
+
   const [expirationHours, setExpirationHours] = useState(24);
   const [password, setPassword] = useState("");
   const [downloadLimit, setDownloadLimit] = useState<number | undefined>(undefined);
@@ -166,7 +179,6 @@ export default function SendPage() {
     });
 
     try {
-      // Step 1: Create transfer and get upload session
       const createPayload: CreateTransferInput = {
         originalFilename: selectedFile.name,
         fileSize: selectedFile.size,
@@ -175,6 +187,8 @@ export default function SendPage() {
         allowPreview,
         allowOriginalDownload: true,
         checksumAlgorithm: "SHA-256",
+        isP2P: transferMode === "p2p",
+        transferMode,
         ...(password ? { password } : {}),
         ...(downloadLimit ? { downloadLimit } : {}),
         ...(senderMessage ? { senderMessage } : {}),
@@ -191,7 +205,47 @@ export default function SendPage() {
         throw new Error(err.error || `Failed to create transfer (${createRes.status})`);
       }
 
-      const { transferId, code, session } = await createRes.json();
+      const resData = await createRes.json();
+      const { transferId, code, session, isP2P } = resData;
+
+      if (isP2P) {
+        // P2P Streaming mode
+        const expDate = new Date(Date.now() + expirationHours * 3600 * 1000).toISOString();
+        setResult({
+          code,
+          originalFilename: selectedFile.name,
+          fileSize: selectedFile.size,
+          expiresAt: expDate,
+          integrityStatus: "verified",
+          checksumValue: undefined,
+          downloadLimit,
+        });
+
+        const appUrl = window.location.origin;
+        const watchUrl = `${appUrl}/receive?code=${code}`;
+        QRCode.toDataURL(watchUrl, {
+          width: 220,
+          margin: 2,
+          color: { dark: "#0f172a", light: "#ffffff" },
+        })
+          .then(setQrDataUrl)
+          .catch(() => {});
+
+        setStep("complete");
+
+        // Initialize P2P WebRTC Session
+        const p2p = new P2PSenderSession(transferId, selectedFile);
+        p2pSessionRef.current = p2p;
+        p2p.onStatusChange = (status, msg) => {
+          setP2pStatus(status);
+          if (msg) setP2pStatusMsg(msg);
+        };
+        p2p.onProgress = (prog) => {
+          setP2pProgress(prog);
+        };
+        p2p.start();
+        return;
+      }
 
       try {
         localStorage.setItem(
@@ -541,6 +595,61 @@ export default function SendPage() {
                     <line x1="18" y1="6" x2="6" y2="18" />
                     <line x1="6" y1="6" x2="18" y2="18" />
                   </svg>
+                </button>
+              </div>
+            </div>
+
+            {/* Transfer Technology Mode */}
+            <div className="vl-card p-5">
+              <label className="font-semibold text-sm mb-1 block" style={{ color: "var(--vl-text-primary)" }}>
+                Transfer Protocol
+              </label>
+              <p className="text-xs mb-3" style={{ color: "var(--vl-text-secondary)" }}>
+                Choose how your video is delivered to the recipient.
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => setTransferMode("p2p")}
+                  className="p-4 rounded-xl text-left transition-all flex flex-col justify-between"
+                  style={{
+                    background: transferMode === "p2p" ? "rgba(99, 102, 241, 0.12)" : "var(--vl-bg-secondary)",
+                    border: `1.5px solid ${transferMode === "p2p" ? "var(--vl-accent)" : "var(--vl-border-default)"}`,
+                  }}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-semibold text-sm flex items-center gap-1.5" style={{ color: "var(--vl-accent)" }}>
+                      ⚡ Direct P2P Stream
+                    </span>
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">
+                      UNLIMITED GB
+                    </span>
+                  </div>
+                  <p className="text-xs" style={{ color: "var(--vl-text-secondary)" }}>
+                    Zero cloud storage required. Direct browser-to-browser encrypted streaming. Ideal for 5GB+ files.
+                  </p>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setTransferMode("cloud")}
+                  className="p-4 rounded-xl text-left transition-all flex flex-col justify-between"
+                  style={{
+                    background: transferMode === "cloud" ? "rgba(99, 102, 241, 0.12)" : "var(--vl-bg-secondary)",
+                    border: `1.5px solid ${transferMode === "cloud" ? "var(--vl-accent)" : "var(--vl-border-default)"}`,
+                  }}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-semibold text-sm flex items-center gap-1.5" style={{ color: "var(--vl-accent)" }}>
+                      ☁️ Cloud Storage
+                    </span>
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-400">
+                      ASYNC
+                    </span>
+                  </div>
+                  <p className="text-xs" style={{ color: "var(--vl-text-secondary)" }}>
+                    File is uploaded to cloud storage. Recipient can download anytime even when you are offline.
+                  </p>
                 </button>
               </div>
             </div>
@@ -923,6 +1032,92 @@ export default function SendPage() {
                   </div>
                 )}
               </div>
+
+              {/* P2P Live Streaming Status Card */}
+              {transferMode === "p2p" && (
+                <div
+                  className="rounded-2xl p-5 mb-6 border animate-in fade-in duration-300"
+                  style={{
+                    background:
+                      p2pStatus === "completed"
+                        ? "rgba(16, 185, 129, 0.08)"
+                        : p2pStatus === "streaming"
+                        ? "rgba(99, 102, 241, 0.08)"
+                        : "var(--vl-bg-secondary)",
+                    borderColor:
+                      p2pStatus === "completed"
+                        ? "var(--vl-success)"
+                        : p2pStatus === "streaming"
+                        ? "var(--vl-accent)"
+                        : "var(--vl-border-default)",
+                  }}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2.5">
+                      <span className="relative flex h-3 w-3">
+                        <span
+                          className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
+                            p2pStatus === "completed"
+                              ? "bg-emerald-400"
+                              : p2pStatus === "streaming"
+                              ? "bg-indigo-400"
+                              : "bg-amber-400"
+                          }`}
+                        />
+                        <span
+                          className={`relative inline-flex rounded-full h-3 w-3 ${
+                            p2pStatus === "completed"
+                              ? "bg-emerald-500"
+                              : p2pStatus === "streaming"
+                              ? "bg-indigo-500"
+                              : "bg-amber-500"
+                          }`}
+                        />
+                      </span>
+                      <span className="font-semibold text-sm" style={{ color: "var(--vl-text-primary)" }}>
+                        {p2pStatus === "waiting_for_peer" && "Waiting for Recipient..."}
+                        {p2pStatus === "connecting" && "Establishing Direct Stream..."}
+                        {p2pStatus === "streaming" && "Streaming File Directly to Recipient"}
+                        {p2pStatus === "completed" && "P2P Stream Complete!"}
+                        {p2pStatus === "failed" && "P2P Stream Interrupted"}
+                      </span>
+                    </div>
+
+                    <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-[var(--vl-accent-subtle)] text-[var(--vl-accent)] font-semibold">
+                      WebRTC P2P
+                    </span>
+                  </div>
+
+                  <p className="text-xs mb-3" style={{ color: "var(--vl-text-secondary)" }}>
+                    {p2pStatusMsg}
+                  </p>
+
+                  {p2pStatus === "streaming" && (
+                    <div className="space-y-2">
+                      <div className="vl-progress-bar">
+                        <div className="vl-progress-fill" style={{ width: `${p2pProgress.percentage}%` }} />
+                      </div>
+                      <div className="flex items-center justify-between text-xs font-mono" style={{ color: "var(--vl-text-secondary)" }}>
+                        <span>
+                          {formatFileSize(p2pProgress.bytesTransferred)} / {formatFileSize(p2pProgress.totalBytes)} ({p2pProgress.percentage}%)
+                        </span>
+                        <span>
+                          ⚡ {formatSpeed(p2pProgress.speed)} · {p2pProgress.eta > 0 ? `${Math.round(p2pProgress.eta)}s remaining` : "finishing"}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="mt-3 pt-3 border-t border-[var(--vl-border-subtle)] flex items-center gap-2 text-[11px]" style={{ color: "var(--vl-text-tertiary)" }}>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="12" cy="12" r="10" />
+                      <line x1="12" y1="8" x2="12" y2="12" />
+                      <line x1="12" y1="16" x2="12.01" y2="16" />
+                    </svg>
+                    <span>Keep this tab open while sending. File streams directly from this device to the recipient.</span>
+                  </div>
+                </div>
+              )}
 
               {/* Transfer Passport */}
               <div className="space-y-3">
