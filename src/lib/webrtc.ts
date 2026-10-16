@@ -1,6 +1,6 @@
 // ==============================================
-// VIDELINK — High-Speed WebRTC P2P Direct Stream Engine
-// Optimized for 5GB+ transfers with in-memory block batching & zero stutter
+// VIDELINK — Ultra High-Speed WebRTC P2P Direct Stream Engine
+// Multi-File Batch Transfer, Instant Cancellation & Zero-Stutter Flow Control
 // ==============================================
 
 export const ICE_SERVERS: RTCConfiguration = {
@@ -12,15 +12,24 @@ export const ICE_SERVERS: RTCConfiguration = {
     { urls: "stun:stun4.l.google.com:19302" },
     { urls: "stun:stun.cloudflare.com:3478" },
     { urls: "stun:stun.services.mozilla.com" },
+    { urls: "stun:stun.relay.metered.ca:80" },
   ],
   iceCandidatePoolSize: 10,
 };
 
-// High-speed chunk and buffer configurations
-const PACKET_CHUNK_SIZE = 64 * 1024; // 64 KB per SCTP packet (universal browser compatibility)
-const DISK_READ_BLOCK_SIZE = 4 * 1024 * 1024; // 4 MB read block from disk into RAM
-const MAX_SCTP_BUFFER = 16 * 1024 * 1024; // 16 MB max buffer capacity
-const LOW_WATERMARK_BUFFER = 4 * 1024 * 1024; // 4 MB low watermark to prevent stall
+// Optimized chunking & backpressure thresholds:
+// 32 KB packet chunk prevents SCTP MTU fragmentation over WAN / mobile carriers.
+// 512 KB buffer threshold prevents bufferbloat while keeping the socket pipeline 100% saturated.
+const PACKET_CHUNK_SIZE = 32 * 1024; // 32 KB
+const DISK_READ_BLOCK_SIZE = 2 * 1024 * 1024; // 2 MB read block
+const BUFFER_THRESHOLD = 512 * 1024; // 512 KB
+
+export interface P2PFileMeta {
+  index: number;
+  name: string;
+  size: number;
+  mimeType: string;
+}
 
 export interface P2PProgress {
   bytesTransferred: number;
@@ -28,6 +37,12 @@ export interface P2PProgress {
   percentage: number;
   speed: number; // bytes per second
   eta: number; // seconds
+  currentFileIndex?: number;
+  totalFiles?: number;
+  currentFileName?: string;
+  currentFileBytesTransferred?: number;
+  currentFileTotalBytes?: number;
+  currentFilePercentage?: number;
 }
 
 export type P2PStatus =
@@ -36,12 +51,13 @@ export type P2PStatus =
   | "connecting"
   | "streaming"
   | "completed"
+  | "cancelled"
   | "failed";
 
 // ===== Signaling Helpers =====
 export async function sendSignal(
   transferId: string,
-  type: "offer" | "answer" | "candidate" | "status",
+  type: "offer" | "answer" | "candidate" | "status" | "cancel",
   data: any,
   from: "sender" | "receiver"
 ) {
@@ -75,23 +91,26 @@ export async function fetchSignals(
 }
 
 // ==============================================
-// SENDER SESSION (High Throughput Optimized)
+// SENDER SESSION (Multi-file & Instant Cancel)
 // ==============================================
 export class P2PSenderSession {
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
   private transferId: string;
-  private file: File;
+  private files: File[];
+  private totalBytes: number;
   private isDestroyed = false;
+  private isCancelled = false;
   private pollingInterval: NodeJS.Timeout | null = null;
   private lastSignalTime = 0;
 
   public onStatusChange?: (status: P2PStatus, message?: string) => void;
   public onProgress?: (progress: P2PProgress) => void;
 
-  constructor(transferId: string, file: File) {
+  constructor(transferId: string, files: File | File[]) {
     this.transferId = transferId;
-    this.file = file;
+    this.files = Array.isArray(files) ? files : [files];
+    this.totalBytes = this.files.reduce((acc, f) => acc + f.size, 0);
   }
 
   public async start() {
@@ -99,12 +118,12 @@ export class P2PSenderSession {
 
     this.pc = new RTCPeerConnection(ICE_SERVERS);
 
-    // Sender creates the DataChannel with max packet life & ordering
+    // Sender creates the DataChannel with ordering
     this.dc = this.pc.createDataChannel("file-transfer", {
       ordered: true,
     });
     this.dc.binaryType = "arraybuffer";
-    this.dc.bufferedAmountLowThreshold = LOW_WATERMARK_BUFFER;
+    this.dc.bufferedAmountLowThreshold = BUFFER_THRESHOLD;
 
     // ICE candidate gathering
     this.pc.onicecandidate = (event) => {
@@ -126,18 +145,31 @@ export class P2PSenderSession {
         this.pc?.connectionState === "failed" ||
         this.pc?.connectionState === "disconnected"
       ) {
-        this.onStatusChange?.("failed", "P2P connection lost.");
+        if (!this.isCancelled && !this.isDestroyed) {
+          this.onStatusChange?.("failed", "P2P connection lost.");
+        }
       }
     };
 
     this.dc.onopen = () => {
-      // Clear polling interval immediately once data channel is open
+      // Clear polling interval once data channel is established
       if (this.pollingInterval) {
         clearInterval(this.pollingInterval);
         this.pollingInterval = null;
       }
-      this.onStatusChange?.("streaming", "Direct stream established! Sending file...");
-      this.streamFile();
+      this.onStatusChange?.("streaming", "Direct stream established! Sending files...");
+      this.streamFiles();
+    };
+
+    this.dc.onmessage = (e) => {
+      if (typeof e.data === "string") {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === "cancel") {
+            this.handlePeerCancelled(msg.by || "receiver", msg.reason);
+          }
+        } catch {}
+      }
     };
 
     // Create SDP Offer
@@ -156,7 +188,7 @@ export class P2PSenderSession {
       "Waiting for receiver to enter code and connect..."
     );
 
-    // Fast polling (300ms) during initial handshake
+    // Handshake polling
     this.startPolling();
   }
 
@@ -164,12 +196,17 @@ export class P2PSenderSession {
     let answered = false;
 
     this.pollingInterval = setInterval(async () => {
-      if (this.isDestroyed) return;
+      if (this.isDestroyed || this.isCancelled) return;
 
       const signals = await fetchSignals(this.transferId, "sender", this.lastSignalTime);
 
       for (const sig of signals) {
         this.lastSignalTime = Math.max(this.lastSignalTime, sig.timestamp);
+
+        if ((sig.type === "cancel" || sig.type === "status") && sig.data?.status === "cancelled") {
+          this.handlePeerCancelled(sig.data.by || "receiver", sig.data.reason);
+          return;
+        }
 
         if (sig.type === "answer" && !answered && this.pc) {
           answered = true;
@@ -190,85 +227,166 @@ export class P2PSenderSession {
     }, 300);
   }
 
-  private async streamFile() {
-    if (!this.dc || this.isDestroyed) return;
+  private async streamFiles() {
+    if (!this.dc || this.isDestroyed || this.isCancelled) return;
 
-    // Send metadata header first
-    const header = JSON.stringify({
-      type: "header",
-      name: this.file.name,
-      size: this.file.size,
-      mimeType: this.file.type,
-    });
-    this.dc.send(header);
+    // Send Manifest
+    const manifest = {
+      type: "manifest",
+      totalFiles: this.files.length,
+      totalBytes: this.totalBytes,
+      files: this.files.map((f, i) => ({
+        index: i,
+        name: f.name,
+        size: f.size,
+        mimeType: f.type || "video/mp4",
+      })),
+    };
+    this.dc.send(JSON.stringify(manifest));
 
-    const totalBytes = this.file.size;
-    let offset = 0;
     const startTime = Date.now();
     let lastProgressTime = startTime;
+    let totalBytesSentSoFar = 0;
 
-    // Pipelined In-Memory Streaming:
-    // Read in 4MB blocks to avoid thousands of small disk seeks,
-    // then stream 64KB chunks directly into the socket buffer.
-    while (offset < totalBytes && !this.isDestroyed) {
-      const blockEnd = Math.min(offset + DISK_READ_BLOCK_SIZE, totalBytes);
-      const blockSlice = this.file.slice(offset, blockEnd);
+    for (let fileIndex = 0; fileIndex < this.files.length; fileIndex++) {
+      if (this.isDestroyed || this.isCancelled) return;
 
-      // Native async block read via browser C++ engine
-      let blockBuffer: ArrayBuffer;
+      const file = this.files[fileIndex];
+
+      // Send file start header
+      this.dc.send(
+        JSON.stringify({
+          type: "file_start",
+          fileIndex,
+          name: file.name,
+          size: file.size,
+          mimeType: file.type || "video/mp4",
+        })
+      );
+
+      let fileOffset = 0;
+      const fileSize = file.size;
+
+      while (fileOffset < fileSize && !this.isDestroyed && !this.isCancelled) {
+        const blockEnd = Math.min(fileOffset + DISK_READ_BLOCK_SIZE, fileSize);
+        const blockSlice = file.slice(fileOffset, blockEnd);
+
+        let blockBuffer: ArrayBuffer;
+        try {
+          blockBuffer = await blockSlice.arrayBuffer();
+        } catch (err) {
+          console.error("File block read failed:", err);
+          this.onStatusChange?.("failed", "Failed to read file from disk.");
+          return;
+        }
+
+        let blockOffset = 0;
+        while (blockOffset < blockBuffer.byteLength && !this.isDestroyed && !this.isCancelled) {
+          // Flow control: if buffer exceeds threshold, wait for drain with safety polling watchdog
+          if (this.dc.bufferedAmount > BUFFER_THRESHOLD) {
+            await new Promise<void>((resolve) => {
+              let resolved = false;
+              const onLow = () => {
+                if (!resolved) {
+                  resolved = true;
+                  this.dc?.removeEventListener("bufferedamountlow", onLow);
+                  resolve();
+                }
+              };
+              this.dc?.addEventListener("bufferedamountlow", onLow);
+              // Safety watchdog: poll every 15ms so we NEVER stall even if event was missed by browser
+              const timer = setInterval(() => {
+                if (this.isDestroyed || this.isCancelled || (this.dc?.bufferedAmount || 0) <= BUFFER_THRESHOLD) {
+                  clearInterval(timer);
+                  onLow();
+                }
+              }, 15);
+            });
+          }
+
+          if (this.isDestroyed || this.isCancelled) return;
+
+          const chunkEnd = Math.min(blockOffset + PACKET_CHUNK_SIZE, blockBuffer.byteLength);
+          const chunk = blockBuffer.slice(blockOffset, chunkEnd);
+          this.dc.send(chunk);
+
+          blockOffset += chunk.byteLength;
+          fileOffset += chunk.byteLength;
+
+          // True speed calculation based on actual dispatched bytes leaving the network buffer
+          const now = Date.now();
+          if (now - lastProgressTime > 120 || (fileIndex === this.files.length - 1 && fileOffset === fileSize)) {
+            const buffered = this.dc?.bufferedAmount || 0;
+            const currentDispatchedTotal = Math.max(0, totalBytesSentSoFar + fileOffset - buffered);
+            const elapsed = (now - startTime) / 1000;
+            const speed = elapsed > 0 ? currentDispatchedTotal / elapsed : 0;
+            const remaining = Math.max(0, this.totalBytes - currentDispatchedTotal);
+            const eta = speed > 0 ? remaining / speed : 0;
+
+            this.onProgress?.({
+              bytesTransferred: currentDispatchedTotal,
+              totalBytes: this.totalBytes,
+              percentage: this.totalBytes > 0 ? Math.min(100, Math.round((currentDispatchedTotal / this.totalBytes) * 100)) : 0,
+              speed,
+              eta,
+              currentFileIndex: fileIndex,
+              totalFiles: this.files.length,
+              currentFileName: file.name,
+              currentFileBytesTransferred: fileOffset,
+              currentFileTotalBytes: fileSize,
+              currentFilePercentage: fileSize > 0 ? Math.min(100, Math.round((fileOffset / fileSize) * 100)) : 0,
+            });
+
+            lastProgressTime = now;
+          }
+        }
+      }
+
+      if (this.isDestroyed || this.isCancelled) return;
+
+      // Send file end marker
+      this.dc.send(
+        JSON.stringify({
+          type: "file_end",
+          fileIndex,
+        })
+      );
+
+      totalBytesSentSoFar += fileSize;
+    }
+
+    if (!this.isDestroyed && !this.isCancelled) {
+      // Send batch complete marker
+      this.dc.send(JSON.stringify({ type: "batch_complete" }));
+      this.onStatusChange?.("completed", "All files transferred successfully!");
+    }
+  }
+
+  public cancel(by: "sender" | "receiver" = "sender", reason = "Transfer cancelled by sender") {
+    if (this.isCancelled || this.isDestroyed) return;
+    this.isCancelled = true;
+
+    // Direct DataChannel cancel message
+    if (this.dc && this.dc.readyState === "open") {
       try {
-        blockBuffer = await blockSlice.arrayBuffer();
-      } catch (err) {
-        console.error("File block read failed:", err);
-        break;
-      }
-
-      let blockOffset = 0;
-      while (blockOffset < blockBuffer.byteLength && !this.isDestroyed) {
-        // High-watermark check: pause only if buffer is saturated
-        if (this.dc.bufferedAmount > MAX_SCTP_BUFFER) {
-          await new Promise<void>((resolve) => {
-            const onLow = () => {
-              this.dc?.removeEventListener("bufferedamountlow", onLow);
-              resolve();
-            };
-            this.dc?.addEventListener("bufferedamountlow", onLow);
-          });
-        }
-
-        const chunkEnd = Math.min(blockOffset + PACKET_CHUNK_SIZE, blockBuffer.byteLength);
-        const chunk = blockBuffer.slice(blockOffset, chunkEnd);
-        this.dc.send(chunk);
-
-        blockOffset += chunk.byteLength;
-        offset += chunk.byteLength;
-
-        // Throttle progress updates to UI every 150ms to keep 60fps
-        const now = Date.now();
-        if (now - lastProgressTime > 150 || offset === totalBytes) {
-          const elapsed = (now - startTime) / 1000;
-          const speed = elapsed > 0 ? offset / elapsed : 0;
-          const remainingBytes = totalBytes - offset;
-          const eta = speed > 0 ? remainingBytes / speed : 0;
-
-          this.onProgress?.({
-            bytesTransferred: offset,
-            totalBytes,
-            percentage: Math.min(100, Math.round((offset / totalBytes) * 100)),
-            speed,
-            eta,
-          });
-
-          lastProgressTime = now;
-        }
-      }
+        this.dc.send(JSON.stringify({ type: "cancel", by, reason }));
+      } catch {}
     }
 
-    if (!this.isDestroyed) {
-      // Send end marker
-      this.dc.send(JSON.stringify({ type: "complete" }));
-      this.onStatusChange?.("completed", "Transfer completed successfully!");
-    }
+    // Signaling server notification
+    sendSignal(this.transferId, "status", { status: "cancelled", by, reason }, "sender");
+
+    const message = by === "sender" ? "Transfer cancelled by you" : "Transfer was cancelled by recipient";
+    this.onStatusChange?.("cancelled", message);
+    this.destroy();
+  }
+
+  private handlePeerCancelled(by: "sender" | "receiver", reason?: string) {
+    if (this.isCancelled || this.isDestroyed) return;
+    this.isCancelled = true;
+    const message = by === "sender" ? "Transfer cancelled by sender" : "Transfer was cancelled by recipient";
+    this.onStatusChange?.("cancelled", message);
+    this.destroy();
   }
 
   public destroy() {
@@ -288,26 +406,39 @@ export class P2PSenderSession {
 }
 
 // ==============================================
-// RECEIVER SESSION (High Throughput Optimized)
+// RECEIVER SESSION (Multi-file & Instant Cancel)
 // ==============================================
 export class P2PReceiverSession {
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
   private transferId: string;
   private isDestroyed = false;
+  private isCancelled = false;
   private pollingInterval: NodeJS.Timeout | null = null;
   private lastSignalTime = 0;
 
-  private receivedChunks: ArrayBuffer[] = [];
-  private receivedBytes = 0;
+  // Stream state
+  private fileList: P2PFileMeta[] = [];
+  private totalFiles = 1;
   private totalBytes = 0;
-  private fileMeta: { name: string; size: number; mimeType: string } | null = null;
+  private totalReceivedBytes = 0;
+
+  // Current file state
+  private currentFileIndex = 0;
+  private currentFileMeta: P2PFileMeta | null = null;
+  private currentFileReceivedBytes = 0;
+  private chunkBuffer: ArrayBuffer[] = [];
+  private chunkBufferSize = 0;
+  private currentFileBlobs: Blob[] = [];
+
   private startTime = 0;
   private lastProgressTime = 0;
 
   public onStatusChange?: (status: P2PStatus, message?: string) => void;
   public onProgress?: (progress: P2PProgress) => void;
-  public onFileReceived?: (blob: Blob, filename: string) => void;
+  public onManifestReceived?: (files: P2PFileMeta[], totalBytes: number) => void;
+  public onFileReceived?: (blob: Blob, filename: string, fileIndex: number, totalFiles: number) => void;
+  public onBatchComplete?: () => void;
 
   constructor(transferId: string) {
     this.transferId = transferId;
@@ -336,12 +467,11 @@ export class P2PReceiverSession {
       this.dc.binaryType = "arraybuffer";
 
       this.dc.onopen = () => {
-        // Clear polling interval immediately once data channel is open
         if (this.pollingInterval) {
           clearInterval(this.pollingInterval);
           this.pollingInterval = null;
         }
-        this.onStatusChange?.("streaming", "Direct stream established! Receiving file...");
+        this.onStatusChange?.("streaming", "Direct stream established! Receiving files...");
         this.startTime = Date.now();
         this.lastProgressTime = this.startTime;
       };
@@ -350,39 +480,74 @@ export class P2PReceiverSession {
         if (typeof e.data === "string") {
           try {
             const msg = JSON.parse(e.data);
-            if (msg.type === "header") {
-              this.fileMeta = {
+            if (msg.type === "cancel") {
+              this.handlePeerCancelled(msg.by || "sender", msg.reason);
+              return;
+            } else if (msg.type === "manifest") {
+              this.totalFiles = msg.totalFiles;
+              this.totalBytes = msg.totalBytes;
+              this.fileList = msg.files || [];
+              this.onManifestReceived?.(this.fileList, this.totalBytes);
+            } else if (msg.type === "file_start") {
+              this.currentFileIndex = msg.fileIndex ?? 0;
+              this.currentFileMeta = {
+                index: msg.fileIndex ?? 0,
                 name: msg.name,
                 size: msg.size,
                 mimeType: msg.mimeType,
               };
-              this.totalBytes = msg.size;
-              this.startTime = Date.now();
-              this.lastProgressTime = this.startTime;
-            } else if (msg.type === "complete") {
-              this.finalizeDownload();
+              this.currentFileReceivedBytes = 0;
+              this.currentFileBlobs = [];
+              this.chunkBuffer = [];
+              this.chunkBufferSize = 0;
+            } else if (msg.type === "file_end") {
+              this.finalizeCurrentFile();
+            } else if (msg.type === "batch_complete" || msg.type === "complete") {
+              if (this.currentFileBlobs.length > 0 || this.chunkBuffer.length > 0) {
+                this.finalizeCurrentFile();
+              }
+              this.onStatusChange?.("completed", "All files received successfully in original quality!");
+              this.onBatchComplete?.();
             }
           } catch {}
         } else if (e.data instanceof ArrayBuffer) {
-          this.receivedChunks.push(e.data);
-          this.receivedBytes += e.data.byteLength;
+          // Accumulate chunk in memory
+          this.chunkBuffer.push(e.data);
+          this.chunkBufferSize += e.data.byteLength;
+          this.currentFileReceivedBytes += e.data.byteLength;
+          this.totalReceivedBytes += e.data.byteLength;
 
-          // Throttle progress updates to 150ms so React doesn't freeze the DOM
+          // Merge into native Blob every 4MB to prevent 10,000+ tiny ArrayBuffers from choking GC
+          if (this.chunkBufferSize >= 4 * 1024 * 1024) {
+            this.currentFileBlobs.push(new Blob(this.chunkBuffer));
+            this.chunkBuffer = [];
+            this.chunkBufferSize = 0;
+          }
+
+          // Throttle progress updates to 120ms
           const now = Date.now();
-          if (now - this.lastProgressTime > 150 || this.receivedBytes === this.totalBytes) {
+          if (now - this.lastProgressTime > 120 || this.totalReceivedBytes === this.totalBytes) {
             const elapsed = (now - this.startTime) / 1000;
-            const speed = elapsed > 0 ? this.receivedBytes / elapsed : 0;
-            const remainingBytes = this.totalBytes - this.receivedBytes;
-            const eta = speed > 0 ? remainingBytes / speed : 0;
+            const speed = elapsed > 0 ? this.totalReceivedBytes / elapsed : 0;
+            const remaining = Math.max(0, this.totalBytes - this.totalReceivedBytes);
+            const eta = speed > 0 ? remaining / speed : 0;
 
             this.onProgress?.({
-              bytesTransferred: this.receivedBytes,
-              totalBytes: this.totalBytes || this.receivedBytes,
+              bytesTransferred: this.totalReceivedBytes,
+              totalBytes: this.totalBytes || this.totalReceivedBytes,
               percentage: this.totalBytes
-                ? Math.min(100, Math.round((this.receivedBytes / this.totalBytes) * 100))
+                ? Math.min(100, Math.round((this.totalReceivedBytes / this.totalBytes) * 100))
                 : 0,
               speed,
               eta,
+              currentFileIndex: this.currentFileIndex,
+              totalFiles: this.totalFiles,
+              currentFileName: this.currentFileMeta?.name,
+              currentFileBytesTransferred: this.currentFileReceivedBytes,
+              currentFileTotalBytes: this.currentFileMeta?.size,
+              currentFilePercentage: this.currentFileMeta?.size
+                ? Math.min(100, Math.round((this.currentFileReceivedBytes / this.currentFileMeta.size) * 100))
+                : 0,
             });
 
             this.lastProgressTime = now;
@@ -399,11 +564,13 @@ export class P2PReceiverSession {
         this.pc?.connectionState === "failed" ||
         this.pc?.connectionState === "disconnected"
       ) {
-        this.onStatusChange?.("failed", "P2P connection lost.");
+        if (!this.isCancelled && !this.isDestroyed) {
+          this.onStatusChange?.("failed", "P2P connection lost.");
+        }
       }
     };
 
-    // Fast polling (300ms) to connect as fast as possible
+    // Handshake polling
     this.startReceiverPolling();
   }
 
@@ -411,12 +578,17 @@ export class P2PReceiverSession {
     let answered = false;
 
     this.pollingInterval = setInterval(async () => {
-      if (this.isDestroyed) return;
+      if (this.isDestroyed || this.isCancelled) return;
 
       const signals = await fetchSignals(this.transferId, "receiver", this.lastSignalTime);
 
       for (const sig of signals) {
         this.lastSignalTime = Math.max(this.lastSignalTime, sig.timestamp);
+
+        if ((sig.type === "cancel" || sig.type === "status") && sig.data?.status === "cancelled") {
+          this.handlePeerCancelled(sig.data.by || "sender", sig.data.reason);
+          return;
+        }
 
         if (sig.type === "offer" && !answered && this.pc) {
           answered = true;
@@ -447,23 +619,62 @@ export class P2PReceiverSession {
     }, 300);
   }
 
-  private finalizeDownload() {
-    const filename = this.fileMeta?.name || "downloaded_video.mp4";
-    const mimeType = this.fileMeta?.mimeType || "video/mp4";
-    const blob = new Blob(this.receivedChunks, { type: mimeType });
+  private finalizeCurrentFile() {
+    if (!this.currentFileMeta) return;
 
-    this.onStatusChange?.("completed", "Video received successfully in original quality!");
-    this.onFileReceived?.(blob, filename);
+    if (this.chunkBuffer.length > 0) {
+      this.currentFileBlobs.push(new Blob(this.chunkBuffer));
+      this.chunkBuffer = [];
+      this.chunkBufferSize = 0;
+    }
+
+    const filename = this.currentFileMeta.name || `video_${this.currentFileIndex + 1}.mp4`;
+    const mimeType = this.currentFileMeta.mimeType || "video/mp4";
+    const blob = new Blob(this.currentFileBlobs, { type: mimeType });
+
+    // Release blob chunks from memory array
+    this.currentFileBlobs = [];
+
+    this.onFileReceived?.(blob, filename, this.currentFileIndex, this.totalFiles);
 
     // Auto-trigger browser download
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    try {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (e) {
+      console.warn("Auto-download failed:", e);
+    }
+  }
+
+  public cancel(by: "sender" | "receiver" = "receiver", reason = "Transfer cancelled by recipient") {
+    if (this.isCancelled || this.isDestroyed) return;
+    this.isCancelled = true;
+
+    if (this.dc && this.dc.readyState === "open") {
+      try {
+        this.dc.send(JSON.stringify({ type: "cancel", by, reason }));
+      } catch {}
+    }
+
+    sendSignal(this.transferId, "status", { status: "cancelled", by, reason }, "receiver");
+
+    const message = by === "receiver" ? "Transfer cancelled by you" : "Transfer was cancelled by sender";
+    this.onStatusChange?.("cancelled", message);
+    this.destroy();
+  }
+
+  private handlePeerCancelled(by: "sender" | "receiver", reason?: string) {
+    if (this.isCancelled || this.isDestroyed) return;
+    this.isCancelled = true;
+    const message = by === "sender" ? "Transfer was cancelled by sender" : "Transfer was cancelled by recipient";
+    this.onStatusChange?.("cancelled", message);
+    this.destroy();
   }
 
   public destroy() {

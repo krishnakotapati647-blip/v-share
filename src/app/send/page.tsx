@@ -46,8 +46,12 @@ export default function SendPage() {
   // Step management
   const [step, setStep] = useState<SendStep>("select");
 
-  // File state
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  // File state (Multiple videos support)
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const selectedFile = selectedFiles[0] || null;
+  const totalSelectedSize = selectedFiles.reduce((acc, f) => acc + f.size, 0);
+  const MAX_BATCH_SIZE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB limit
+
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -121,54 +125,89 @@ export default function SendPage() {
     }
   }, [result]);
 
-  // ===== File Selection =====
-  const handleFileSelect = useCallback((file: File) => {
-    // Validate extension
-    const ext = "." + file.name.split(".").pop()?.toLowerCase();
-    if (!ALLOWED_EXTENSIONS.includes(ext as typeof ALLOWED_EXTENSIONS[number])) {
-      alert(`Unsupported file format: ${ext}\nSupported: ${ALLOWED_EXTENSIONS.join(", ")}`);
-      return;
-    }
-    // Validate size
-    if (file.size > MAX_FILE_SIZE_BYTES) {
-      alert(`File too large: ${formatFileSize(file.size)}\nMaximum: ${formatFileSize(MAX_FILE_SIZE_BYTES)}`);
-      return;
-    }
-    if (file.size === 0) {
-      alert("Cannot upload an empty file.");
-      return;
-    }
-    setSelectedFile(file);
-    setStep("settings");
+  // ===== Multi-File Selection =====
+  const handleFilesSelect = useCallback(
+    (files: FileList | File[]) => {
+      const validFiles: File[] = [];
+      let runningTotal = totalSelectedSize;
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const ext = "." + file.name.split(".").pop()?.toLowerCase();
+        if (!ALLOWED_EXTENSIONS.includes(ext as typeof ALLOWED_EXTENSIONS[number])) {
+          alert(`Unsupported format for "${file.name}": ${ext}\nAllowed: ${ALLOWED_EXTENSIONS.join(", ")}`);
+          continue;
+        }
+        if (file.size === 0) {
+          alert(`"${file.name}" is empty and cannot be uploaded.`);
+          continue;
+        }
+        if (runningTotal + file.size > MAX_BATCH_SIZE_BYTES) {
+          alert(`Total size exceeds 5 GB with "${file.name}". Maximum combined limit is 5 GB.`);
+          break;
+        }
+        validFiles.push(file);
+        runningTotal += file.size;
+      }
+
+      if (validFiles.length > 0) {
+        setSelectedFiles((prev) => {
+          const existingKeys = new Set(prev.map((f) => `${f.name}_${f.size}`));
+          const filteredNew = validFiles.filter((f) => !existingKeys.has(`${f.name}_${f.size}`));
+          return [...prev, ...filteredNew];
+        });
+        setStep("settings");
+      }
+    },
+    [totalSelectedSize]
+  );
+
+  const removeFile = useCallback((index: number) => {
+    setSelectedFiles((prev) => {
+      const updated = prev.filter((_, i) => i !== index);
+      if (updated.length === 0) {
+        setStep("select");
+      }
+      return updated;
+    });
   }, []);
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
       setDragOver(false);
-      const file = e.dataTransfer.files[0];
-      if (file) handleFileSelect(file);
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        handleFilesSelect(e.dataTransfer.files);
+      }
     },
-    [handleFileSelect]
+    [handleFilesSelect]
   );
 
   const handleInputChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (file) handleFileSelect(file);
+      if (e.target.files && e.target.files.length > 0) {
+        handleFilesSelect(e.target.files);
+        e.target.value = "";
+      }
     },
-    [handleFileSelect]
+    [handleFilesSelect]
   );
 
   // ===== Upload Logic =====
   const startUpload = useCallback(async () => {
-    if (!selectedFile) return;
+    if (selectedFiles.length === 0) return;
     setStep("uploading");
     uploadAbortRef.current = false;
 
-    const totalParts = Math.ceil(selectedFile.size / UPLOAD_PART_SIZE);
+    const totalBatchBytes = selectedFiles.reduce((acc, f) => acc + f.size, 0);
+    const displayTitle =
+      selectedFiles.length === 1
+        ? selectedFiles[0].name
+        : `${selectedFiles[0].name} (+${selectedFiles.length - 1} videos)`;
+
+    const totalParts = Math.ceil(totalBatchBytes / UPLOAD_PART_SIZE);
     setProgress({
-      totalBytes: selectedFile.size,
+      totalBytes: totalBatchBytes,
       uploadedBytes: 0,
       percentage: 0,
       speed: 0,
@@ -180,9 +219,9 @@ export default function SendPage() {
 
     try {
       const createPayload: CreateTransferInput = {
-        originalFilename: selectedFile.name,
-        fileSize: selectedFile.size,
-        contentType: selectedFile.type || "video/mp4",
+        originalFilename: displayTitle,
+        fileSize: totalBatchBytes,
+        contentType: selectedFiles.length === 1 ? (selectedFiles[0].type || "video/mp4") : "video/mp4",
         expirationHours,
         allowPreview,
         allowOriginalDownload: true,
@@ -209,12 +248,12 @@ export default function SendPage() {
       const { transferId, code, session, isP2P } = resData;
 
       if (isP2P) {
-        // P2P Streaming mode
+        // P2P Direct Streaming mode with Multi-File support
         const expDate = new Date(Date.now() + expirationHours * 3600 * 1000).toISOString();
         setResult({
           code,
-          originalFilename: selectedFile.name,
-          fileSize: selectedFile.size,
+          originalFilename: displayTitle,
+          fileSize: totalBatchBytes,
           expiresAt: expDate,
           integrityStatus: "verified",
           checksumValue: undefined,
@@ -233,8 +272,8 @@ export default function SendPage() {
 
         setStep("complete");
 
-        // Initialize P2P WebRTC Session
-        const p2p = new P2PSenderSession(transferId, selectedFile);
+        // Initialize P2P WebRTC Session with all selected files
+        const p2p = new P2PSenderSession(transferId, selectedFiles);
         p2pSessionRef.current = p2p;
         p2p.onStatusChange = (status, msg) => {
           setP2pStatus(status);
@@ -528,6 +567,7 @@ export default function SendPage() {
               <input
                 ref={fileInputRef}
                 type="file"
+                multiple
                 accept={ALLOWED_EXTENSIONS.join(",")}
                 onChange={handleInputChange}
                 className="hidden"
@@ -546,10 +586,10 @@ export default function SendPage() {
                 </div>
                 <div>
                   <p className="font-semibold mb-1" style={{ color: "var(--vl-text-primary)" }}>
-                    Drop your video here or click to browse
+                    Drop your videos here or click to browse
                   </p>
                   <p className="text-sm" style={{ color: "var(--vl-text-tertiary)" }}>
-                    MP4, MOV, MKV, WebM and more · Up to {formatFileSize(MAX_FILE_SIZE_BYTES)}
+                    Select single or multiple videos · Up to {formatFileSize(MAX_BATCH_SIZE_BYTES)} total
                   </p>
                 </div>
               </div>
@@ -558,43 +598,81 @@ export default function SendPage() {
         )}
 
         {/* ===== STEP: SETTINGS ===== */}
-        {step === "settings" && selectedFile && (
+        {step === "settings" && selectedFiles.length > 0 && (
           <div className="vl-animate-in space-y-6">
-            {/* Selected file card */}
+            {/* Selected files header & list */}
             <div className="vl-card p-5">
-              <div className="flex items-start gap-4">
-                <div
-                  className="w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0"
-                  style={{ background: "var(--vl-accent-subtle)", color: "var(--vl-accent)" }}
-                >
-                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <polygon points="23 7 16 12 23 17 23 7" />
-                    <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-                  </svg>
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="font-semibold truncate" style={{ color: "var(--vl-text-primary)" }}>
-                    {selectedFile.name}
-                  </p>
-                  <div className="flex items-center gap-3 mt-1 text-sm" style={{ color: "var(--vl-text-secondary)" }}>
-                    <span>{formatFileSize(selectedFile.size)}</span>
-                    <span>·</span>
-                    <span>{selectedFile.type || "Unknown type"}</span>
+              <div className="flex items-center justify-between mb-3">
+                <span className="font-semibold text-sm" style={{ color: "var(--vl-text-primary)" }}>
+                  Selected Videos ({selectedFiles.length})
+                </span>
+                <span className="text-xs font-mono px-2.5 py-1 rounded-full bg-[var(--vl-accent-subtle)] text-[var(--vl-accent)] font-semibold">
+                  Total: {formatFileSize(totalSelectedSize)} / 5 GB
+                </span>
+              </div>
+
+              <div className="space-y-2.5 max-h-64 overflow-y-auto pr-1">
+                {selectedFiles.map((file, idx) => (
+                  <div
+                    key={`${file.name}_${idx}`}
+                    className="flex items-center justify-between p-3 rounded-xl bg-[var(--vl-bg-secondary)] border border-[var(--vl-border-subtle)]"
+                  >
+                    <div className="flex items-center gap-3 min-w-0 flex-1 mr-2">
+                      <div
+                        className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
+                        style={{ background: "var(--vl-accent-subtle)", color: "var(--vl-accent)" }}
+                      >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <polygon points="23 7 16 12 23 17 23 7" />
+                          <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                        </svg>
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="font-medium text-xs truncate" style={{ color: "var(--vl-text-primary)" }}>
+                          {file.name}
+                        </p>
+                        <p className="text-[11px]" style={{ color: "var(--vl-text-tertiary)" }}>
+                          {formatFileSize(file.size)}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removeFile(idx)}
+                      className="p-1.5 rounded-lg text-red-400 hover:text-red-300 hover:bg-red-500/10 transition"
+                      aria-label={`Remove ${file.name}`}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <line x1="18" y1="6" x2="6" y2="18" />
+                        <line x1="6" y1="6" x2="18" y2="18" />
+                      </svg>
+                    </button>
                   </div>
-                </div>
+                ))}
+              </div>
+
+              {/* Add more videos button */}
+              <div className="mt-3 pt-3 border-t border-[var(--vl-border-subtle)] flex items-center justify-between">
                 <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="text-xs font-semibold text-[var(--vl-accent)] hover:underline inline-flex items-center gap-1.5"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="12" y1="5" x2="12" y2="19" />
+                    <line x1="5" y1="12" x2="19" y2="12" />
+                  </svg>
+                  + Add More Videos
+                </button>
+                <button
+                  type="button"
                   onClick={() => {
-                    setSelectedFile(null);
+                    setSelectedFiles([]);
                     setStep("select");
                   }}
-                  className="p-2 rounded-lg hover:opacity-80 transition"
-                  style={{ color: "var(--vl-text-tertiary)" }}
-                  aria-label="Remove selected file"
+                  className="text-xs text-[var(--vl-text-tertiary)] hover:underline"
                 >
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
+                  Clear all
                 </button>
               </div>
             </div>
@@ -1035,88 +1113,174 @@ export default function SendPage() {
 
               {/* P2P Live Streaming Status Card */}
               {transferMode === "p2p" && (
-                <div
-                  className="rounded-2xl p-5 mb-6 border animate-in fade-in duration-300"
-                  style={{
-                    background:
-                      p2pStatus === "completed"
-                        ? "rgba(16, 185, 129, 0.08)"
-                        : p2pStatus === "streaming"
-                        ? "rgba(99, 102, 241, 0.08)"
-                        : "var(--vl-bg-secondary)",
-                    borderColor:
-                      p2pStatus === "completed"
-                        ? "var(--vl-success)"
-                        : p2pStatus === "streaming"
-                        ? "var(--vl-accent)"
-                        : "var(--vl-border-default)",
-                  }}
-                >
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2.5">
-                      <span className="relative flex h-3 w-3">
-                        <span
-                          className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                            p2pStatus === "completed"
-                              ? "bg-emerald-400"
-                              : p2pStatus === "streaming"
-                              ? "bg-indigo-400"
-                              : "bg-amber-400"
-                          }`}
-                        />
-                        <span
-                          className={`relative inline-flex rounded-full h-3 w-3 ${
-                            p2pStatus === "completed"
-                              ? "bg-emerald-500"
-                              : p2pStatus === "streaming"
-                              ? "bg-indigo-500"
-                              : "bg-amber-500"
-                          }`}
-                        />
-                      </span>
-                      <span className="font-semibold text-sm" style={{ color: "var(--vl-text-primary)" }}>
-                        {p2pStatus === "waiting_for_peer" && "Waiting for Recipient..."}
-                        {p2pStatus === "connecting" && "Establishing Direct Stream..."}
-                        {p2pStatus === "streaming" && "Streaming File Directly to Recipient"}
-                        {p2pStatus === "completed" && "P2P Stream Complete!"}
-                        {p2pStatus === "failed" && "P2P Stream Interrupted"}
-                      </span>
+                <>
+                  {p2pStatus === "cancelled" ? (
+                    <div
+                      className="rounded-2xl p-5 mb-6 border animate-in fade-in duration-300"
+                      style={{
+                        background: "rgba(239, 68, 68, 0.08)",
+                        borderColor: "var(--vl-error)",
+                      }}
+                    >
+                      <div className="flex items-center gap-3 mb-2">
+                        <span className="w-8 h-8 rounded-full bg-red-500/20 text-red-500 flex items-center justify-center font-bold text-sm">
+                          ✕
+                        </span>
+                        <div>
+                          <h4 className="font-semibold text-sm" style={{ color: "var(--vl-text-primary)" }}>
+                            Transfer Cancelled
+                          </h4>
+                          <p className="text-xs" style={{ color: "var(--vl-error)" }}>
+                            {p2pStatusMsg || "The transfer has been cancelled."}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="mt-4 flex gap-3">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            p2pSessionRef.current?.destroy();
+                            setStep("select");
+                            setSelectedFiles([]);
+                            setP2pStatus("waiting_for_peer");
+                          }}
+                          className="vl-btn-secondary text-xs py-2 px-4"
+                        >
+                          Start New Transfer
+                        </button>
+                      </div>
                     </div>
+                  ) : (
+                    <div
+                      className="rounded-2xl p-5 mb-6 border animate-in fade-in duration-300"
+                      style={{
+                        background:
+                          p2pStatus === "completed"
+                            ? "rgba(16, 185, 129, 0.08)"
+                            : p2pStatus === "streaming"
+                            ? "rgba(99, 102, 241, 0.08)"
+                            : "var(--vl-bg-secondary)",
+                        borderColor:
+                          p2pStatus === "completed"
+                            ? "var(--vl-success)"
+                            : p2pStatus === "streaming"
+                            ? "var(--vl-accent)"
+                            : "var(--vl-border-default)",
+                      }}
+                    >
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2.5">
+                          <span className="relative flex h-3 w-3">
+                            <span
+                              className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
+                                p2pStatus === "completed"
+                                  ? "bg-emerald-400"
+                                  : p2pStatus === "streaming"
+                                  ? "bg-indigo-400"
+                                  : "bg-amber-400"
+                              }`}
+                            />
+                            <span
+                              className={`relative inline-flex rounded-full h-3 w-3 ${
+                                p2pStatus === "completed"
+                                  ? "bg-emerald-500"
+                                  : p2pStatus === "streaming"
+                                  ? "bg-indigo-500"
+                                  : "bg-amber-500"
+                              }`}
+                            />
+                          </span>
+                          <span className="font-semibold text-sm" style={{ color: "var(--vl-text-primary)" }}>
+                            {p2pStatus === "waiting_for_peer" && "Waiting for Recipient..."}
+                            {p2pStatus === "connecting" && "Establishing Direct Stream..."}
+                            {p2pStatus === "streaming" && "Streaming File Directly to Recipient"}
+                            {p2pStatus === "completed" && "P2P Stream Complete!"}
+                            {p2pStatus === "failed" && "P2P Stream Interrupted"}
+                          </span>
+                        </div>
 
-                    <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-[var(--vl-accent-subtle)] text-[var(--vl-accent)] font-semibold">
-                      WebRTC P2P
-                    </span>
-                  </div>
-
-                  <p className="text-xs mb-3" style={{ color: "var(--vl-text-secondary)" }}>
-                    {p2pStatusMsg}
-                  </p>
-
-                  {p2pStatus === "streaming" && (
-                    <div className="space-y-2">
-                      <div className="vl-progress-bar">
-                        <div className="vl-progress-fill" style={{ width: `${p2pProgress.percentage}%` }} />
-                      </div>
-                      <div className="flex items-center justify-between text-xs font-mono" style={{ color: "var(--vl-text-secondary)" }}>
-                        <span>
-                          {formatFileSize(p2pProgress.bytesTransferred)} / {formatFileSize(p2pProgress.totalBytes)} ({p2pProgress.percentage}%)
+                        <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-[var(--vl-accent-subtle)] text-[var(--vl-accent)] font-semibold">
+                          WebRTC P2P
                         </span>
-                        <span>
-                          ⚡ {formatSpeed(p2pProgress.speed)} · {p2pProgress.eta > 0 ? `${Math.round(p2pProgress.eta)}s remaining` : "finishing"}
-                        </span>
                       </div>
+
+                      <p className="text-xs mb-3" style={{ color: "var(--vl-text-secondary)" }}>
+                        {p2pStatusMsg}
+                      </p>
+
+                      {/* Current file in batch indicator */}
+                      {p2pStatus === "streaming" && p2pProgress.totalFiles && p2pProgress.totalFiles > 1 && (
+                        <div className="mb-3 p-2.5 rounded-xl bg-[var(--vl-bg-primary)] border border-[var(--vl-border-subtle)]">
+                          <div className="flex items-center justify-between text-xs mb-1.5 font-medium">
+                            <span className="truncate mr-2" style={{ color: "var(--vl-text-primary)" }}>
+                              Video {(p2pProgress.currentFileIndex ?? 0) + 1} of {p2pProgress.totalFiles}:{" "}
+                              <span style={{ color: "var(--vl-accent)" }}>{p2pProgress.currentFileName}</span>
+                            </span>
+                            <span className="font-mono text-[var(--vl-accent)]">
+                              {p2pProgress.currentFilePercentage ?? 0}%
+                            </span>
+                          </div>
+                          <div className="w-full bg-[var(--vl-bg-secondary)] h-1.5 rounded-full overflow-hidden">
+                            <div
+                              className="h-full rounded-full transition-all duration-200"
+                              style={{
+                                width: `${p2pProgress.currentFilePercentage ?? 0}%`,
+                                background: "var(--vl-accent)",
+                              }}
+                            />
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Overall Batch Progress */}
+                      {p2pStatus === "streaming" && (
+                        <div className="space-y-2">
+                          <div className="vl-progress-bar">
+                            <div className="vl-progress-fill" style={{ width: `${p2pProgress.percentage}%` }} />
+                          </div>
+                          <div className="flex items-center justify-between text-xs font-mono" style={{ color: "var(--vl-text-secondary)" }}>
+                            <span>
+                              {formatFileSize(p2pProgress.bytesTransferred)} / {formatFileSize(p2pProgress.totalBytes)} ({p2pProgress.percentage}%)
+                            </span>
+                            <span>
+                              ⚡ {formatSpeed(p2pProgress.speed)} · {p2pProgress.eta > 0 ? `${Math.round(p2pProgress.eta)}s remaining` : "finishing"}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Cancel Transfer Button */}
+                      {(p2pStatus === "waiting_for_peer" || p2pStatus === "connecting" || p2pStatus === "streaming") && (
+                        <div className="mt-3 pt-3 border-t border-[var(--vl-border-subtle)] flex items-center justify-between">
+                          <span className="text-[11px]" style={{ color: "var(--vl-text-tertiary)" }}>
+                            Keep tab open while transferring
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (confirm("Are you sure you want to cancel this transfer?")) {
+                                p2pSessionRef.current?.cancel("sender");
+                              }
+                            }}
+                            className="text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 inline-flex items-center gap-1.5 py-1 px-2.5 rounded-lg border border-red-500/20 transition"
+                          >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <line x1="18" y1="6" x2="6" y2="18" />
+                              <line x1="6" y1="6" x2="18" y2="18" />
+                            </svg>
+                            Cancel Transfer
+                          </button>
+                        </div>
+                      )}
+
+                      {p2pStatus === "completed" && (
+                        <div className="mt-3 pt-3 border-t border-[var(--vl-border-subtle)] flex items-center gap-2 text-xs" style={{ color: "var(--vl-success)" }}>
+                          <span>🎉 Transfer completed successfully! All files delivered.</span>
+                        </div>
+                      )}
                     </div>
                   )}
-
-                  <div className="mt-3 pt-3 border-t border-[var(--vl-border-subtle)] flex items-center gap-2 text-[11px]" style={{ color: "var(--vl-text-tertiary)" }}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <circle cx="12" cy="12" r="10" />
-                      <line x1="12" y1="8" x2="12" y2="12" />
-                      <line x1="12" y1="16" x2="12.01" y2="16" />
-                    </svg>
-                    <span>Keep this tab open while sending. File streams directly from this device to the recipient.</span>
-                  </div>
-                </div>
+                </>
               )}
 
               {/* Transfer Passport */}

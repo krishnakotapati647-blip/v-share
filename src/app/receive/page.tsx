@@ -29,6 +29,8 @@ function ReceivePageContent() {
   // P2P Streaming states
   const [p2pStatus, setP2pStatus] = useState<P2PStatus | null>(null);
   const [p2pStatusMsg, setP2pStatusMsg] = useState<string>("");
+  const [manifestFiles, setManifestFiles] = useState<{ name: string; size: number; mimeType: string }[]>([]);
+  const [receivedFiles, setReceivedFiles] = useState<{ filename: string; blob: Blob; url: string; size: number }[]>([]);
   const [p2pProgress, setP2pProgress] = useState<P2PProgress>({
     bytesTransferred: 0,
     totalBytes: 0,
@@ -152,7 +154,19 @@ function ReceivePageContent() {
         setP2pProgress(prog);
       };
 
-      p2p.onFileReceived = () => {
+      p2p.onManifestReceived = (files) => {
+        setManifestFiles(files);
+      };
+
+      p2p.onFileReceived = (blob, filename, fileIndex, totalFiles) => {
+        const url = URL.createObjectURL(blob);
+        setReceivedFiles((prev) => [...prev, { filename, blob, url, size: blob.size }]);
+        if (fileIndex + 1 === totalFiles) {
+          setP2pComplete(true);
+        }
+      };
+
+      p2p.onBatchComplete = () => {
         setP2pComplete(true);
       };
 
@@ -436,81 +450,196 @@ function ReceivePageContent() {
 
               {/* P2P Live Streaming Progress Card */}
               {p2pStatus && (
-                <div
-                  className="rounded-2xl p-5 mb-6 border animate-in fade-in duration-300"
-                  style={{
-                    background:
-                      p2pComplete
-                        ? "rgba(16, 185, 129, 0.08)"
-                        : p2pStatus === "streaming"
-                        ? "rgba(99, 102, 241, 0.08)"
-                        : "var(--vl-bg-secondary)",
-                    borderColor:
-                      p2pComplete
-                        ? "var(--vl-success)"
-                        : p2pStatus === "streaming"
-                        ? "var(--vl-accent)"
-                        : "var(--vl-border-default)",
-                  }}
-                >
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2.5">
-                      <span className="relative flex h-3 w-3">
-                        <span
-                          className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                            p2pComplete
-                              ? "bg-emerald-400"
-                              : p2pStatus === "streaming"
-                              ? "bg-indigo-400"
-                              : "bg-amber-400"
-                          }`}
-                        />
-                        <span
-                          className={`relative inline-flex rounded-full h-3 w-3 ${
-                            p2pComplete
-                              ? "bg-emerald-500"
-                              : p2pStatus === "streaming"
-                              ? "bg-indigo-500"
-                              : "bg-amber-500"
-                          }`}
-                        />
-                      </span>
-                      <span className="font-semibold text-sm" style={{ color: "var(--vl-text-primary)" }}>
-                        {p2pComplete
-                          ? "Download Complete!"
-                          : p2pStatus === "streaming"
-                          ? "Streaming Video Directly from Sender..."
-                          : p2pStatusMsg || "Connecting to Sender..."}
-                      </span>
-                    </div>
-
-                    <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-[var(--vl-accent-subtle)] text-[var(--vl-accent)] font-semibold">
-                      WebRTC P2P
-                    </span>
-                  </div>
-
-                  {p2pStatus === "streaming" && (
-                    <div className="space-y-2 mt-3">
-                      <div className="vl-progress-bar">
-                        <div className="vl-progress-fill" style={{ width: `${p2pProgress.percentage}%` }} />
+                <>
+                  {p2pStatus === "cancelled" ? (
+                    <div
+                      className="rounded-2xl p-5 mb-6 border animate-in fade-in duration-300"
+                      style={{
+                        background: "rgba(239, 68, 68, 0.08)",
+                        borderColor: "var(--vl-error)",
+                      }}
+                    >
+                      <div className="flex items-center gap-3 mb-2">
+                        <span className="w-8 h-8 rounded-full bg-red-500/20 text-red-500 flex items-center justify-center font-bold text-sm">
+                          ✕
+                        </span>
+                        <div>
+                          <h4 className="font-semibold text-sm" style={{ color: "var(--vl-text-primary)" }}>
+                            Transfer Cancelled
+                          </h4>
+                          <p className="text-xs" style={{ color: "var(--vl-error)" }}>
+                            {p2pStatusMsg || "The transfer has been cancelled."}
+                          </p>
+                        </div>
                       </div>
-                      <div className="flex items-center justify-between text-xs font-mono" style={{ color: "var(--vl-text-secondary)" }}>
-                        <span>
-                          {formatFileSize(p2pProgress.bytesTransferred)} / {formatFileSize(p2pProgress.totalBytes)} ({p2pProgress.percentage}%)
-                        </span>
-                        <span>
-                          ⚡ {formatSpeed(p2pProgress.speed)} · {p2pProgress.eta > 0 ? `${Math.round(p2pProgress.eta)}s remaining` : "finishing"}
-                        </span>
+                      <div className="mt-4 flex gap-3">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            p2pReceiverRef.current?.destroy();
+                            setP2pStatus(null);
+                            setP2pComplete(false);
+                            setReceivedFiles([]);
+                          }}
+                          className="vl-btn-secondary text-xs py-2 px-4"
+                        >
+                          Try Again
+                        </button>
                       </div>
                     </div>
-                  )}
+                  ) : (
+                    <div
+                      className="rounded-2xl p-5 mb-6 border animate-in fade-in duration-300"
+                      style={{
+                        background:
+                          p2pComplete
+                            ? "rgba(16, 185, 129, 0.08)"
+                            : p2pStatus === "streaming"
+                            ? "rgba(99, 102, 241, 0.08)"
+                            : "var(--vl-bg-secondary)",
+                        borderColor:
+                          p2pComplete
+                            ? "var(--vl-success)"
+                            : p2pStatus === "streaming"
+                            ? "var(--vl-accent)"
+                            : "var(--vl-border-default)",
+                      }}
+                    >
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2.5">
+                          <span className="relative flex h-3 w-3">
+                            <span
+                              className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
+                                p2pComplete
+                                  ? "bg-emerald-400"
+                                  : p2pStatus === "streaming"
+                                  ? "bg-indigo-400"
+                                  : "bg-amber-400"
+                              }`}
+                            />
+                            <span
+                              className={`relative inline-flex rounded-full h-3 w-3 ${
+                                p2pComplete
+                                  ? "bg-emerald-500"
+                                  : p2pStatus === "streaming"
+                                  ? "bg-indigo-500"
+                                  : "bg-amber-500"
+                              }`}
+                            />
+                          </span>
+                          <span className="font-semibold text-sm" style={{ color: "var(--vl-text-primary)" }}>
+                            {p2pComplete
+                              ? "Download Complete!"
+                              : p2pStatus === "streaming"
+                              ? "Streaming Video Directly from Sender..."
+                              : p2pStatusMsg || "Connecting to Sender..."}
+                          </span>
+                        </div>
 
-                  {p2pComplete && (
-                    <p className="text-xs mt-2" style={{ color: "var(--vl-success)" }}>
-                      🎉 Video has been saved directly to your computer in 100% original quality!
-                    </p>
+                        <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-[var(--vl-accent-subtle)] text-[var(--vl-accent)] font-semibold">
+                          WebRTC P2P
+                        </span>
+                      </div>
+
+                      {/* Current file in batch indicator */}
+                      {p2pStatus === "streaming" && p2pProgress.totalFiles && p2pProgress.totalFiles > 1 && (
+                        <div className="mt-3 mb-2 p-2.5 rounded-xl bg-[var(--vl-bg-primary)] border border-[var(--vl-border-subtle)]">
+                          <div className="flex items-center justify-between text-xs mb-1.5 font-medium">
+                            <span className="truncate mr-2" style={{ color: "var(--vl-text-primary)" }}>
+                              Video {(p2pProgress.currentFileIndex ?? 0) + 1} of {p2pProgress.totalFiles}:{" "}
+                              <span style={{ color: "var(--vl-accent)" }}>{p2pProgress.currentFileName}</span>
+                            </span>
+                            <span className="font-mono text-[var(--vl-accent)]">
+                              {p2pProgress.currentFilePercentage ?? 0}%
+                            </span>
+                          </div>
+                          <div className="w-full bg-[var(--vl-bg-secondary)] h-1.5 rounded-full overflow-hidden">
+                            <div
+                              className="h-full rounded-full transition-all duration-200"
+                              style={{
+                                width: `${p2pProgress.currentFilePercentage ?? 0}%`,
+                                background: "var(--vl-accent)",
+                              }}
+                            />
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Overall Progress Bar */}
+                      {p2pStatus === "streaming" && (
+                        <div className="space-y-2 mt-3">
+                          <div className="vl-progress-bar">
+                            <div className="vl-progress-fill" style={{ width: `${p2pProgress.percentage}%` }} />
+                          </div>
+                          <div className="flex items-center justify-between text-xs font-mono" style={{ color: "var(--vl-text-secondary)" }}>
+                            <span>
+                              {formatFileSize(p2pProgress.bytesTransferred)} / {formatFileSize(p2pProgress.totalBytes)} ({p2pProgress.percentage}%)
+                            </span>
+                            <span>
+                              ⚡ {formatSpeed(p2pProgress.speed)} · {p2pProgress.eta > 0 ? `${Math.round(p2pProgress.eta)}s remaining` : "finishing"}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Cancel Transfer Button */}
+                      {(p2pStatus === "initializing" || p2pStatus === "connecting" || p2pStatus === "streaming") && (
+                        <div className="mt-3 pt-3 border-t border-[var(--vl-border-subtle)] flex items-center justify-between">
+                          <span className="text-[11px]" style={{ color: "var(--vl-text-tertiary)" }}>
+                            Keep tab open during transfer
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (confirm("Are you sure you want to cancel receiving this transfer?")) {
+                                p2pReceiverRef.current?.cancel("receiver");
+                              }
+                            }}
+                            className="text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 inline-flex items-center gap-1.5 py-1 px-2.5 rounded-lg border border-red-500/20 transition"
+                          >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <line x1="18" y1="6" x2="6" y2="18" />
+                              <line x1="6" y1="6" x2="18" y2="18" />
+                            </svg>
+                            Cancel Transfer
+                          </button>
+                        </div>
+                      )}
+
+                      {p2pComplete && (
+                        <div className="mt-3">
+                          <p className="text-xs mb-3" style={{ color: "var(--vl-success)" }}>
+                            🎉 All files saved directly to your computer in 100% original quality!
+                          </p>
+                          {receivedFiles.length > 0 && (
+                            <div className="space-y-2 mt-2 pt-2 border-t border-[var(--vl-border-subtle)]">
+                              <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--vl-text-tertiary)] block">
+                                Received Videos ({receivedFiles.length})
+                              </span>
+                              {receivedFiles.map((rf, idx) => (
+                                <div
+                                  key={idx}
+                                  className="flex items-center justify-between p-2.5 rounded-lg bg-[var(--vl-bg-primary)] border border-[var(--vl-border-subtle)] text-xs"
+                                >
+                                  <span className="font-medium truncate mr-2" style={{ color: "var(--vl-text-primary)" }}>
+                                    {rf.filename} ({formatFileSize(rf.size)})
+                                  </span>
+                                  <a
+                                    href={rf.url}
+                                    download={rf.filename}
+                                    className="text-[var(--vl-accent)] hover:underline flex-shrink-0 font-medium"
+                                  >
+                                    Download Again
+                                  </a>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   )}
-                </div>
+                </>
               )}
 
               {/* Actions */}
