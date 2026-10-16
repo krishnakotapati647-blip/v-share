@@ -125,6 +125,34 @@ export default function SendPage() {
     }
   }, [result]);
 
+  // Prevent accidental close & keep screen awake during transfer
+  useEffect(() => {
+    const isTransferring = p2pStatus === "streaming" || p2pStatus === "connecting";
+    if (!isTransferring) return;
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
+    // Keep screen awake via Screen Wake Lock API if supported
+    let wakeLock: any = null;
+    if (typeof navigator !== "undefined" && "wakeLock" in navigator) {
+      (navigator as any).wakeLock.request("screen").then((lock: any) => {
+        wakeLock = lock;
+      }).catch(() => {});
+    }
+
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      if (wakeLock) {
+        wakeLock.release().catch(() => {});
+      }
+    };
+  }, [p2pStatus]);
+
   // ===== Multi-File Selection =====
   const handleFilesSelect = useCallback(
     (files: FileList | File[]) => {

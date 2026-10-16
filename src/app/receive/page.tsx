@@ -47,6 +47,33 @@ function ReceivePageContent() {
     };
   }, []);
 
+  // Prevent accidental close & keep screen awake during transfer
+  useEffect(() => {
+    const isTransferring = p2pStatus === "streaming" || p2pStatus === "connecting" || p2pStatus === "initializing";
+    if (!isTransferring) return;
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
+    let wakeLock: any = null;
+    if (typeof navigator !== "undefined" && "wakeLock" in navigator) {
+      (navigator as any).wakeLock.request("screen").then((lock: any) => {
+        wakeLock = lock;
+      }).catch(() => {});
+    }
+
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      if (wakeLock) {
+        wakeLock.release().catch(() => {});
+      }
+    };
+  }, [p2pStatus]);
+
   // Pre-fill code from URL query
   useEffect(() => {
     const urlCode = searchParams.get("code");
