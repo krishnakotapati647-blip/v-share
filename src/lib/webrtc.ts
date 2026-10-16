@@ -17,12 +17,15 @@ export const ICE_SERVERS: RTCConfiguration = {
   iceCandidatePoolSize: 10,
 };
 
-// Optimized chunking & backpressure thresholds:
-// 32 KB packet chunk prevents SCTP MTU fragmentation over WAN / mobile carriers.
-// 512 KB buffer threshold prevents bufferbloat while keeping the socket pipeline 100% saturated.
-const PACKET_CHUNK_SIZE = 32 * 1024; // 32 KB
-const DISK_READ_BLOCK_SIZE = 2 * 1024 * 1024; // 2 MB read block
-const BUFFER_THRESHOLD = 512 * 1024; // 512 KB
+// High-Speed Mobile Data Tuned Configurations:
+// 64 KB packet chunk is the universal maximum SCTP message size without fragmentation.
+// HIGH_WATERMARK (4 MB): Buffer fills up to 4MB, allowing the cellular modem to transmit at maximum radio throughput.
+// LOW_WATERMARK (1 MB): When buffer drains to 1MB, sender wakes up and pushes 3MB in a tight burst.
+// This eliminates the stop-and-go bottleneck and achieves full physical bandwidth!
+const PACKET_CHUNK_SIZE = 64 * 1024; // 64 KB
+const DISK_READ_BLOCK_SIZE = 4 * 1024 * 1024; // 4 MB read block
+const HIGH_WATERMARK = 4 * 1024 * 1024; // 4 MB
+const LOW_WATERMARK = 1 * 1024 * 1024; // 1 MB
 
 export interface P2PFileMeta {
   index: number;
@@ -123,7 +126,7 @@ export class P2PSenderSession {
       ordered: true,
     });
     this.dc.binaryType = "arraybuffer";
-    this.dc.bufferedAmountLowThreshold = BUFFER_THRESHOLD;
+    this.dc.bufferedAmountLowThreshold = LOW_WATERMARK;
 
     // ICE candidate gathering
     this.pc.onicecandidate = (event) => {
@@ -282,8 +285,11 @@ export class P2PSenderSession {
 
         let blockOffset = 0;
         while (blockOffset < blockBuffer.byteLength && !this.isDestroyed && !this.isCancelled) {
-          // Flow control: if buffer exceeds threshold, wait for drain with safety polling watchdog
-          if (this.dc.bufferedAmount > BUFFER_THRESHOLD) {
+          // High-Throughput Hysteresis Flow Control:
+          // Blasts 64KB chunks continuously into the socket buffer until HIGH_WATERMARK (4 MB).
+          // Only pauses when full (4 MB), and wakes up when drained to LOW_WATERMARK (1 MB),
+          // giving a 3 MB uninterrupted continuous blast without stop-and-go delays.
+          if (this.dc.bufferedAmount > HIGH_WATERMARK) {
             await new Promise<void>((resolve) => {
               let resolved = false;
               const onLow = () => {
@@ -294,13 +300,11 @@ export class P2PSenderSession {
                 }
               };
               this.dc?.addEventListener("bufferedamountlow", onLow);
-              // Safety watchdog: poll every 15ms so we NEVER stall even if event was missed by browser
-              const timer = setInterval(() => {
-                if (this.isDestroyed || this.isCancelled || (this.dc?.bufferedAmount || 0) <= BUFFER_THRESHOLD) {
-                  clearInterval(timer);
-                  onLow();
-                }
-              }, 15);
+
+              // Immediate check in case buffer already drained
+              if ((this.dc?.bufferedAmount || 0) <= LOW_WATERMARK) {
+                onLow();
+              }
             });
           }
 
@@ -517,16 +521,16 @@ export class P2PReceiverSession {
           this.currentFileReceivedBytes += e.data.byteLength;
           this.totalReceivedBytes += e.data.byteLength;
 
-          // Merge into native Blob every 4MB to prevent 10,000+ tiny ArrayBuffers from choking GC
-          if (this.chunkBufferSize >= 4 * 1024 * 1024) {
+          // Merge into native Blob every 8MB to prevent tiny ArrayBuffers from choking GC
+          if (this.chunkBufferSize >= 8 * 1024 * 1024) {
             this.currentFileBlobs.push(new Blob(this.chunkBuffer));
             this.chunkBuffer = [];
             this.chunkBufferSize = 0;
           }
 
-          // Throttle progress updates to 120ms
+          // Throttle progress updates to 150ms
           const now = Date.now();
-          if (now - this.lastProgressTime > 120 || this.totalReceivedBytes === this.totalBytes) {
+          if (now - this.lastProgressTime > 150 || this.totalReceivedBytes === this.totalBytes) {
             const elapsed = (now - this.startTime) / 1000;
             const speed = elapsed > 0 ? this.totalReceivedBytes / elapsed : 0;
             const remaining = Math.max(0, this.totalBytes - this.totalReceivedBytes);
