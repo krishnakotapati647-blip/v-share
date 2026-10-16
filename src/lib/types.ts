@@ -51,7 +51,7 @@ export const MAX_FILE_SIZE_BYTES = parseInt(
 );
 
 export const UPLOAD_PART_SIZE = parseInt(
-  process.env.MAX_UPLOAD_PART_SIZE_BYTES || "10485760", // 10 MB
+  process.env.MAX_UPLOAD_PART_SIZE_BYTES || "4194304", // 4 MB (Vercel serverless payload safe)
   10
 );
 
