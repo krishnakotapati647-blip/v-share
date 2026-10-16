@@ -480,3 +480,59 @@ export async function getTransferEvents(transferId: string): Promise<StoredTrans
     .filter((e) => e.transferId === transferId)
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 }
+
+export async function getExpiredTransfers(): Promise<StoredTransfer[]> {
+  const now = new Date();
+  const hasPrisma = await checkPrisma();
+  if (hasPrisma) {
+    try {
+      const records = await prisma.transfer.findMany({
+        where: {
+          expiresAt: { lt: now },
+          uploadStatus: { not: "expired" },
+        },
+      });
+      return records.map((r: any) => ({
+        ...r,
+        fileSize: Number(r.fileSize),
+        createdAt: r.createdAt.toISOString(),
+        expiresAt: r.expiresAt.toISOString(),
+        updatedAt: r.updatedAt.toISOString(),
+      }));
+    } catch {}
+  }
+
+  const db = ensureLocalDb();
+  const expired: StoredTransfer[] = [];
+  const nowMs = now.getTime();
+  for (const t of Object.values(db.transfers)) {
+    if (new Date(t.expiresAt).getTime() < nowMs && t.uploadStatus !== "expired") {
+      expired.push(t);
+    }
+  }
+  return expired;
+}
+
+export async function markTransferExpired(id: string): Promise<void> {
+  await updateTransfer(id, { uploadStatus: "expired" });
+  await createTransferEvent(id, "transfer_expired");
+}
+
+export async function deleteTransfer(id: string): Promise<void> {
+  const hasPrisma = await checkPrisma();
+  if (hasPrisma) {
+    try {
+      await prisma.transfer.delete({ where: { id } });
+      return;
+    } catch {}
+  }
+
+  const db = ensureLocalDb();
+  delete db.transfers[id];
+  // Remove associated sessions and events
+  for (const [sId, session] of Object.entries(db.uploadSessions)) {
+    if (session.transferId === id) delete db.uploadSessions[sId];
+  }
+  db.events = db.events.filter((e) => e.transferId !== id);
+  saveLocalDb(db);
+}

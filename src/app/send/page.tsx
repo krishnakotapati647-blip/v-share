@@ -76,6 +76,20 @@ export default function SendPage() {
   const [codeCopied, setCodeCopied] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [showQr, setShowQr] = useState(false);
+  const [activeTransferNotice, setActiveTransferNotice] = useState<{ filename: string; code: string } | null>(null);
+
+  // Check for previous active transfer on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("videlink_active_transfer");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed.filename && parsed.code) {
+          setActiveTransferNotice(parsed);
+        }
+      }
+    } catch {}
+  }, []);
 
   // Generate QR Code on completion
   useEffect(() => {
@@ -178,6 +192,19 @@ export default function SendPage() {
       }
 
       const { transferId, code, session } = await createRes.json();
+
+      try {
+        localStorage.setItem(
+          "videlink_active_transfer",
+          JSON.stringify({
+            transferId,
+            code,
+            filename: selectedFile.name,
+            fileSize: selectedFile.size,
+            timestamp: Date.now(),
+          })
+        );
+      } catch {}
 
       // Step 2: Upload parts with bounded concurrency
       const partETags: { partNumber: number; etag: string }[] = [];
@@ -309,6 +336,9 @@ export default function SendPage() {
       const finalizeData = await finalizeRes.json();
 
       // Step 4: Done!
+      try {
+        localStorage.removeItem("videlink_active_transfer");
+      } catch {}
       setProgress((p) => ({ ...p, status: "complete", percentage: 100 }));
       setResult({
         code,
@@ -391,6 +421,40 @@ export default function SendPage() {
         {/* ===== STEP: SELECT FILE ===== */}
         {step === "select" && (
           <div className="vl-animate-in">
+            {activeTransferNotice && (
+              <div className="mb-6 p-4 rounded-xl bg-[var(--vl-bg-secondary)] border border-[var(--vl-accent)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <span className="text-xl">📁</span>
+                  <div>
+                    <p className="text-sm font-semibold text-[var(--vl-text-primary)]">
+                      Recent Transfer: {activeTransferNotice.filename}
+                    </p>
+                    <p className="text-xs text-[var(--vl-text-secondary)] font-mono">
+                      Code: {activeTransferNotice.code}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Link
+                    href={`/receive?code=${encodeURIComponent(activeTransferNotice.code)}`}
+                    className="vl-btn-primary text-xs py-1.5 px-3"
+                  >
+                    View Transfer
+                  </Link>
+                  <button
+                    onClick={() => {
+                      try {
+                        localStorage.removeItem("videlink_active_transfer");
+                      } catch {}
+                      setActiveTransferNotice(null);
+                    }}
+                    className="text-xs text-[var(--vl-text-tertiary)] hover:text-[var(--vl-text-primary)] px-2"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
             <div
               className={`vl-dropzone ${dragOver ? "drag-over" : ""}`}
               onDragOver={(e) => {

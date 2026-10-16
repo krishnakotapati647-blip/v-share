@@ -219,6 +219,34 @@ async function runTests() {
       log("6.1 Audit Trail", `Recorded ${events.length} lifecycle events: ${events.map(e => e.eventType).join(" -> ")}`);
     }
 
+    // ----------------------------------------------------
+    // TEST 7: Passport Events by Code
+    // ----------------------------------------------------
+    console.log("\n--- TEST 7: Passport Events by Code ---");
+    const codeEventsRes = await fetch(`${BASE_URL}/api/transfers/events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    if (!codeEventsRes.ok) throw new Error(`Fetch events by code failed: ${codeEventsRes.status}`);
+    const { events: codeEvents } = await codeEventsRes.json();
+    log("7.1 Code Passport Events", `Fetched ${codeEvents.length} passport event(s) by code: ${codeEvents.map(e => e.eventType).join(", ")}`);
+
+    // ----------------------------------------------------
+    // TEST 8: Automated Cleanup Maintenance Job
+    // ----------------------------------------------------
+    console.log("\n--- TEST 8: Cleanup Maintenance Job ---");
+    const cleanupRes = await fetch(`${BASE_URL}/api/transfers/cleanup`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer c8e3f29b48d21a97e4165d3098f4a132bc6e71928347fa65e492b0174c839d2e",
+      },
+    });
+    if (!cleanupRes.ok) throw new Error(`Cleanup failed: ${cleanupRes.status}`);
+    const cleanupReport = await cleanupRes.json();
+    log("8.1 Maintenance Cleanup", `Report: expired=${cleanupReport.expiredTransfersCleaned}, abandoned=${cleanupReport.abandonedUploadsCleaned}, status=ok`);
+
     console.log("\n==========================================");
     if (allPassed) {
       console.log("🎉 ALL TESTS PASSED SUCCESSFULLY!");

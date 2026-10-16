@@ -20,6 +20,9 @@ function ReceivePageContent() {
   const [password, setPassword] = useState("");
   const [passwordError, setPasswordError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
+  const [events, setEvents] = useState<{ id: string; eventType: string; createdAt: string; metadata?: any }[] | null>(null);
+  const [loadingEvents, setLoadingEvents] = useState(false);
+  const [showPassport, setShowPassport] = useState(false);
 
   // Pre-fill code from URL query
   useEffect(() => {
@@ -139,6 +142,32 @@ function ReceivePageContent() {
       setDownloading(false);
     }
   }, [transfer, password]);
+
+  // ===== Load Transfer Passport Audit Events =====
+  const loadPassportEvents = useCallback(async () => {
+    if (!transfer) return;
+    if (showPassport) {
+      setShowPassport(false);
+      return;
+    }
+    setLoadingEvents(true);
+    setShowPassport(true);
+    try {
+      const res = await fetch("/api/transfers/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: transfer.code, ...(password ? { password } : {}) }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setEvents(data.events || []);
+      }
+    } catch (e) {
+      console.error("Failed to load events:", e);
+    } finally {
+      setLoadingEvents(false);
+    }
+  }, [transfer, password, showPassport]);
 
   return (
     <div className="min-h-[calc(100vh-4rem)] py-12">
@@ -398,6 +427,58 @@ function ReceivePageContent() {
                   </button>
                 )}
               </div>
+
+              {/* Passport & Audit Trail Button */}
+              <div className="mt-4 pt-4 border-t border-[var(--vl-border-subtle)] flex items-center justify-between">
+                <button
+                  onClick={loadPassportEvents}
+                  className="text-xs font-medium text-[var(--vl-accent)] hover:underline inline-flex items-center gap-1.5"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="10" />
+                    <polyline points="12 6 12 12 16 14" />
+                  </svg>
+                  {showPassport ? "Hide Transfer Passport" : "View Transfer Passport & Audit Trail"}
+                </button>
+                <span className="text-[11px] text-[var(--vl-text-tertiary)]">Cryptographically Verified</span>
+              </div>
+
+              {/* Passport Timeline */}
+              {showPassport && (
+                <div className="mt-4 p-4 rounded-xl bg-[var(--vl-bg-secondary)] border border-[var(--vl-border-subtle)] animate-in fade-in duration-200">
+                  <div className="text-xs font-semibold text-[var(--vl-text-tertiary)] uppercase tracking-wider mb-3 flex items-center justify-between">
+                    <span>Audit Trail Passport</span>
+                    {loadingEvents && <span className="animate-spin text-xs">⏳</span>}
+                  </div>
+                  {events && events.length > 0 ? (
+                    <div className="space-y-3">
+                      {events.map((ev, idx) => {
+                        const eventLabels: Record<string, { label: string; icon: string }> = {
+                          upload_initiated: { label: "Transfer Initiated", icon: "📤" },
+                          upload_completed: { label: "Upload Completed & Verified", icon: "📦" },
+                          transfer_viewed: { label: "Transfer Accessed", icon: "👁️" },
+                          download_authorized: { label: "Download Authorized", icon: "⬇️" },
+                          transfer_expired: { label: "Transfer Expired", icon: "⏳" },
+                        };
+                        const info = eventLabels[ev.eventType] || { label: ev.eventType, icon: "📋" };
+                        return (
+                          <div key={ev.id || idx} className="flex items-start gap-3 text-xs">
+                            <span className="text-base leading-none">{info.icon}</span>
+                            <div className="flex-1 min-w-0">
+                              <p className="font-medium text-[var(--vl-text-primary)]">{info.label}</p>
+                              <p className="text-[11px] text-[var(--vl-text-tertiary)]">
+                                {new Date(ev.createdAt).toLocaleString()}
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : !loadingEvents ? (
+                    <p className="text-xs text-[var(--vl-text-tertiary)]">No audit records found.</p>
+                  ) : null}
+                </div>
+              )}
 
               {!isPlayableInBrowser(transfer.contentType) && transfer.allowPreview && (
                 <p className="text-xs mt-4 text-center" style={{ color: "var(--vl-text-tertiary)" }}>
