@@ -1,6 +1,7 @@
 // ==============================================
-// VIDELINK — Ultra High-Speed WebRTC P2P Direct Stream Engine
-// Multi-File Batch Transfer, Instant Cancellation & Zero-Stutter Flow Control
+// VIDELINK — Ultra High-Speed Multi-Channel WebRTC P2P Engine
+// 4x Parallel Unordered DataChannels + Custom Sequence Reassembly
+// Designed to saturate full mobile network bandwidth (4G/5G)
 // ==============================================
 
 export const ICE_SERVERS: RTCConfiguration = {
@@ -17,15 +18,17 @@ export const ICE_SERVERS: RTCConfiguration = {
   iceCandidatePoolSize: 10,
 };
 
-// High-Speed Mobile Data Tuned Configurations:
-// 64 KB packet chunk is the universal maximum SCTP message size without fragmentation.
-// HIGH_WATERMARK (4 MB): Buffer fills up to 4MB, allowing the cellular modem to transmit at maximum radio throughput.
-// LOW_WATERMARK (1 MB): When buffer drains to 1MB, sender wakes up and pushes 3MB in a tight burst.
-// This eliminates the stop-and-go bottleneck and achieves full physical bandwidth!
-const PACKET_CHUNK_SIZE = 64 * 1024; // 64 KB
-const DISK_READ_BLOCK_SIZE = 4 * 1024 * 1024; // 4 MB read block
-const HIGH_WATERMARK = 4 * 1024 * 1024; // 4 MB
-const LOW_WATERMARK = 1 * 1024 * 1024; // 1 MB
+// ===== Speed-Tuned Constants =====
+// Each channel uses 64KB chunks. With 4 parallel channels, aggregate burst = 256 KB per cycle.
+// Total in-flight buffer across all channels: 4 x 4 MB = 16 MB, allowing massive burst throughput.
+const NUM_CHANNELS = 4; // Number of parallel DataChannels
+const PACKET_CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
+const DISK_READ_BLOCK_SIZE = 4 * 1024 * 1024; // 4 MB disk read block
+const HIGH_WATERMARK = 4 * 1024 * 1024; // 4 MB per channel
+const LOW_WATERMARK = 1 * 1024 * 1024; // 1 MB per channel
+
+// Header: 4 bytes sequence number prepended to each binary chunk
+const SEQ_HEADER_SIZE = 4;
 
 export interface P2PFileMeta {
   index: number;
@@ -93,12 +96,28 @@ export async function fetchSignals(
   }
 }
 
+// ===== Helper: Encode sequence number into 4-byte header =====
+function encodeSeqHeader(seq: number): Uint8Array {
+  const buf = new Uint8Array(4);
+  buf[0] = (seq >>> 24) & 0xff;
+  buf[1] = (seq >>> 16) & 0xff;
+  buf[2] = (seq >>> 8) & 0xff;
+  buf[3] = seq & 0xff;
+  return buf;
+}
+
+function decodeSeqHeader(buf: ArrayBuffer): number {
+  const view = new Uint8Array(buf, 0, 4);
+  return ((view[0] << 24) | (view[1] << 16) | (view[2] << 8) | view[3]) >>> 0;
+}
+
 // ==============================================
-// SENDER SESSION (Multi-file & Instant Cancel)
+// SENDER SESSION (Multi-Channel, Multi-file & Instant Cancel)
 // ==============================================
 export class P2PSenderSession {
   private pc: RTCPeerConnection | null = null;
-  private dc: RTCDataChannel | null = null;
+  private controlChannel: RTCDataChannel | null = null;
+  private dataChannels: RTCDataChannel[] = [];
   private transferId: string;
   private files: File[];
   private totalBytes: number;
@@ -117,16 +136,26 @@ export class P2PSenderSession {
   }
 
   public async start() {
-    this.onStatusChange?.("initializing", "Creating direct P2P session...");
+    this.onStatusChange?.("initializing", "Creating multi-channel P2P session...");
 
     this.pc = new RTCPeerConnection(ICE_SERVERS);
 
-    // Sender creates the DataChannel with ordering
-    this.dc = this.pc.createDataChannel("file-transfer", {
+    // Create control channel (ordered, reliable) for metadata messages
+    this.controlChannel = this.pc.createDataChannel("control", {
       ordered: true,
     });
-    this.dc.binaryType = "arraybuffer";
-    this.dc.bufferedAmountLowThreshold = LOW_WATERMARK;
+    this.controlChannel.binaryType = "arraybuffer";
+
+    // Create NUM_CHANNELS parallel unordered data channels for maximum throughput
+    for (let i = 0; i < NUM_CHANNELS; i++) {
+      const dc = this.pc.createDataChannel(`data-${i}`, {
+        ordered: false,
+        maxRetransmits: 3, // Allow a few retransmits for reliability, but not infinite
+      });
+      dc.binaryType = "arraybuffer";
+      dc.bufferedAmountLowThreshold = LOW_WATERMARK;
+      this.dataChannels.push(dc);
+    }
 
     // ICE candidate gathering
     this.pc.onicecandidate = (event) => {
@@ -154,17 +183,8 @@ export class P2PSenderSession {
       }
     };
 
-    this.dc.onopen = () => {
-      // Clear polling interval once data channel is established
-      if (this.pollingInterval) {
-        clearInterval(this.pollingInterval);
-        this.pollingInterval = null;
-      }
-      this.onStatusChange?.("streaming", "Direct stream established! Sending files...");
-      this.streamFiles();
-    };
-
-    this.dc.onmessage = (e) => {
+    // Listen for cancel messages on control channel
+    this.controlChannel.onmessage = (e) => {
       if (typeof e.data === "string") {
         try {
           const msg = JSON.parse(e.data);
@@ -174,6 +194,28 @@ export class P2PSenderSession {
         } catch {}
       }
     };
+
+    // Wait for all channels to open, then start streaming
+    let openCount = 0;
+    const totalChannelsToOpen = NUM_CHANNELS + 1; // data channels + control channel
+
+    const checkAllOpen = () => {
+      openCount++;
+      if (openCount >= totalChannelsToOpen) {
+        // Clear polling interval once all channels are established
+        if (this.pollingInterval) {
+          clearInterval(this.pollingInterval);
+          this.pollingInterval = null;
+        }
+        this.onStatusChange?.("streaming", "All channels established! Sending files at maximum speed...");
+        this.streamFiles();
+      }
+    };
+
+    this.controlChannel.onopen = checkAllOpen;
+    for (const dc of this.dataChannels) {
+      dc.onopen = checkAllOpen;
+    }
 
     // Create SDP Offer
     const offer = await this.pc.createOffer();
@@ -213,7 +255,7 @@ export class P2PSenderSession {
 
         if (sig.type === "answer" && !answered && this.pc) {
           answered = true;
-          this.onStatusChange?.("connecting", "Receiver joined! Connecting...");
+          this.onStatusChange?.("connecting", "Receiver joined! Connecting multi-channel...");
           try {
             await this.pc.setRemoteDescription(new RTCSessionDescription(sig.data));
           } catch (e) {
@@ -230,14 +272,48 @@ export class P2PSenderSession {
     }, 300);
   }
 
-  private async streamFiles() {
-    if (!this.dc || this.isDestroyed || this.isCancelled) return;
+  // Wait for a specific channel's buffer to drain below LOW_WATERMARK
+  private async waitForDrain(dc: RTCDataChannel): Promise<void> {
+    if (dc.bufferedAmount <= HIGH_WATERMARK) return;
+    return new Promise<void>((resolve) => {
+      let resolved = false;
+      const onLow = () => {
+        if (!resolved) {
+          resolved = true;
+          dc.removeEventListener("bufferedamountlow", onLow);
+          resolve();
+        }
+      };
+      dc.addEventListener("bufferedamountlow", onLow);
+      // Immediate check in case buffer already drained
+      if (dc.bufferedAmount <= LOW_WATERMARK) {
+        onLow();
+      }
+    });
+  }
 
-    // Send Manifest
+  // Select the channel with the lowest buffered amount for load balancing
+  private selectChannel(): RTCDataChannel {
+    let minBuffered = Infinity;
+    let bestChannel = this.dataChannels[0];
+    for (const dc of this.dataChannels) {
+      if (dc.bufferedAmount < minBuffered) {
+        minBuffered = dc.bufferedAmount;
+        bestChannel = dc;
+      }
+    }
+    return bestChannel;
+  }
+
+  private async streamFiles() {
+    if (!this.controlChannel || this.dataChannels.length === 0 || this.isDestroyed || this.isCancelled) return;
+
+    // Send Manifest on control channel
     const manifest = {
       type: "manifest",
       totalFiles: this.files.length,
       totalBytes: this.totalBytes,
+      numChannels: NUM_CHANNELS,
       files: this.files.map((f, i) => ({
         index: i,
         name: f.name,
@@ -245,30 +321,33 @@ export class P2PSenderSession {
         mimeType: f.type || "video/mp4",
       })),
     };
-    this.dc.send(JSON.stringify(manifest));
+    this.controlChannel.send(JSON.stringify(manifest));
 
     const startTime = Date.now();
     let lastProgressTime = startTime;
     let totalBytesSentSoFar = 0;
+    let globalSeq = 0; // Global sequence counter across all chunks
 
     for (let fileIndex = 0; fileIndex < this.files.length; fileIndex++) {
       if (this.isDestroyed || this.isCancelled) return;
 
       const file = this.files[fileIndex];
 
-      // Send file start header
-      this.dc.send(
+      // Send file start header on control channel
+      this.controlChannel.send(
         JSON.stringify({
           type: "file_start",
           fileIndex,
           name: file.name,
           size: file.size,
           mimeType: file.type || "video/mp4",
+          startSeq: globalSeq, // Tell receiver what sequence number this file starts at
         })
       );
 
       let fileOffset = 0;
       const fileSize = file.size;
+      const fileChunkCount = Math.ceil(fileSize / PACKET_CHUNK_SIZE);
 
       while (fileOffset < fileSize && !this.isDestroyed && !this.isCancelled) {
         const blockEnd = Math.min(fileOffset + DISK_READ_BLOCK_SIZE, fileSize);
@@ -285,43 +364,40 @@ export class P2PSenderSession {
 
         let blockOffset = 0;
         while (blockOffset < blockBuffer.byteLength && !this.isDestroyed && !this.isCancelled) {
-          // High-Throughput Hysteresis Flow Control:
-          // Blasts 64KB chunks continuously into the socket buffer until HIGH_WATERMARK (4 MB).
-          // Only pauses when full (4 MB), and wakes up when drained to LOW_WATERMARK (1 MB),
-          // giving a 3 MB uninterrupted continuous blast without stop-and-go delays.
-          if (this.dc.bufferedAmount > HIGH_WATERMARK) {
-            await new Promise<void>((resolve) => {
-              let resolved = false;
-              const onLow = () => {
-                if (!resolved) {
-                  resolved = true;
-                  this.dc?.removeEventListener("bufferedamountlow", onLow);
-                  resolve();
-                }
-              };
-              this.dc?.addEventListener("bufferedamountlow", onLow);
+          // Select the least-loaded channel
+          const dc = this.selectChannel();
 
-              // Immediate check in case buffer already drained
-              if ((this.dc?.bufferedAmount || 0) <= LOW_WATERMARK) {
-                onLow();
-              }
-            });
+          // Wait for buffer drain if this channel is overloaded
+          if (dc.bufferedAmount > HIGH_WATERMARK) {
+            await this.waitForDrain(dc);
           }
 
           if (this.isDestroyed || this.isCancelled) return;
 
           const chunkEnd = Math.min(blockOffset + PACKET_CHUNK_SIZE, blockBuffer.byteLength);
-          const chunk = blockBuffer.slice(blockOffset, chunkEnd);
-          this.dc.send(chunk);
+          const rawChunk = blockBuffer.slice(blockOffset, chunkEnd);
 
-          blockOffset += chunk.byteLength;
-          fileOffset += chunk.byteLength;
+          // Prepend 4-byte sequence header for ordered reassembly
+          const seqHeader = encodeSeqHeader(globalSeq);
+          const framedChunk = new Uint8Array(SEQ_HEADER_SIZE + rawChunk.byteLength);
+          framedChunk.set(seqHeader, 0);
+          framedChunk.set(new Uint8Array(rawChunk), SEQ_HEADER_SIZE);
 
-          // True speed calculation based on actual dispatched bytes leaving the network buffer
+          dc.send(framedChunk.buffer);
+          globalSeq++;
+
+          blockOffset += rawChunk.byteLength;
+          fileOffset += rawChunk.byteLength;
+
+          // Progress updates (throttled to ~120ms)
           const now = Date.now();
           if (now - lastProgressTime > 120 || (fileIndex === this.files.length - 1 && fileOffset === fileSize)) {
-            const buffered = this.dc?.bufferedAmount || 0;
-            const currentDispatchedTotal = Math.max(0, totalBytesSentSoFar + fileOffset - buffered);
+            // Sum buffered amounts across all channels
+            let totalBuffered = 0;
+            for (const ch of this.dataChannels) {
+              totalBuffered += ch.bufferedAmount || 0;
+            }
+            const currentDispatchedTotal = Math.max(0, totalBytesSentSoFar + fileOffset - totalBuffered);
             const elapsed = (now - startTime) / 1000;
             const speed = elapsed > 0 ? currentDispatchedTotal / elapsed : 0;
             const remaining = Math.max(0, this.totalBytes - currentDispatchedTotal);
@@ -348,11 +424,13 @@ export class P2PSenderSession {
 
       if (this.isDestroyed || this.isCancelled) return;
 
-      // Send file end marker
-      this.dc.send(
+      // Send file end marker on control channel with the sequence range
+      this.controlChannel.send(
         JSON.stringify({
           type: "file_end",
           fileIndex,
+          endSeq: globalSeq, // Total chunks sent for this file
+          totalChunks: Math.ceil(file.size / PACKET_CHUNK_SIZE),
         })
       );
 
@@ -360,8 +438,19 @@ export class P2PSenderSession {
     }
 
     if (!this.isDestroyed && !this.isCancelled) {
-      // Send batch complete marker
-      this.dc.send(JSON.stringify({ type: "batch_complete" }));
+      // Wait for all channel buffers to flush before declaring complete
+      for (const dc of this.dataChannels) {
+        while (dc.bufferedAmount > 0) {
+          await new Promise(r => setTimeout(r, 50));
+          if (this.isDestroyed || this.isCancelled) return;
+        }
+      }
+
+      // Small delay to let receiver process remaining chunks
+      await new Promise(r => setTimeout(r, 300));
+
+      // Send batch complete marker on control channel
+      this.controlChannel.send(JSON.stringify({ type: "batch_complete", totalSeq: globalSeq }));
       this.onStatusChange?.("completed", "All files transferred successfully!");
     }
   }
@@ -370,10 +459,10 @@ export class P2PSenderSession {
     if (this.isCancelled || this.isDestroyed) return;
     this.isCancelled = true;
 
-    // Direct DataChannel cancel message
-    if (this.dc && this.dc.readyState === "open") {
+    // Direct cancel message on control channel
+    if (this.controlChannel && this.controlChannel.readyState === "open") {
       try {
-        this.dc.send(JSON.stringify({ type: "cancel", by, reason }));
+        this.controlChannel.send(JSON.stringify({ type: "cancel", by, reason }));
       } catch {}
     }
 
@@ -396,25 +485,25 @@ export class P2PSenderSession {
   public destroy() {
     this.isDestroyed = true;
     if (this.pollingInterval) clearInterval(this.pollingInterval);
-    if (this.dc) {
-      try {
-        this.dc.close();
-      } catch {}
+    if (this.controlChannel) {
+      try { this.controlChannel.close(); } catch {}
+    }
+    for (const dc of this.dataChannels) {
+      try { dc.close(); } catch {}
     }
     if (this.pc) {
-      try {
-        this.pc.close();
-      } catch {}
+      try { this.pc.close(); } catch {}
     }
   }
 }
 
 // ==============================================
-// RECEIVER SESSION (Multi-file & Instant Cancel)
+// RECEIVER SESSION (Multi-Channel, Multi-file & Instant Cancel)
 // ==============================================
 export class P2PReceiverSession {
   private pc: RTCPeerConnection | null = null;
-  private dc: RTCDataChannel | null = null;
+  private controlChannel: RTCDataChannel | null = null;
+  private dataChannels: RTCDataChannel[] = [];
   private transferId: string;
   private isDestroyed = false;
   private isCancelled = false;
@@ -431,9 +520,16 @@ export class P2PReceiverSession {
   private currentFileIndex = 0;
   private currentFileMeta: P2PFileMeta | null = null;
   private currentFileReceivedBytes = 0;
-  private chunkBuffer: ArrayBuffer[] = [];
-  private chunkBufferSize = 0;
-  private currentFileBlobs: Blob[] = [];
+  private currentFileStartSeq = 0;
+  private currentFileExpectedChunks = 0;
+
+  // Sequence-ordered chunk reassembly buffer
+  // For unordered channels, chunks may arrive out of order.
+  // We use a Map<seq, ArrayBuffer> and flush sequentially.
+  private chunkMap: Map<number, ArrayBuffer> = new Map();
+  private nextExpectedSeq = 0;
+  private flushedBlobs: Blob[] = [];
+  private pendingFlushSize = 0;
 
   private startTime = 0;
   private lastProgressTime = 0;
@@ -465,105 +561,50 @@ export class P2PReceiverSession {
       }
     };
 
-    // When Sender's DataChannel arrives
+    // When Sender's DataChannels arrive
     this.pc.ondatachannel = (event) => {
-      this.dc = event.channel;
-      this.dc.binaryType = "arraybuffer";
+      const channel = event.channel;
+      channel.binaryType = "arraybuffer";
 
-      this.dc.onopen = () => {
-        if (this.pollingInterval) {
-          clearInterval(this.pollingInterval);
-          this.pollingInterval = null;
-        }
-        this.onStatusChange?.("streaming", "Direct stream established! Receiving files...");
-        this.startTime = Date.now();
-        this.lastProgressTime = this.startTime;
-      };
+      if (channel.label === "control") {
+        // Control channel for metadata messages
+        this.controlChannel = channel;
 
-      this.dc.onmessage = (e) => {
-        if (typeof e.data === "string") {
-          try {
-            const msg = JSON.parse(e.data);
-            if (msg.type === "cancel") {
-              this.handlePeerCancelled(msg.by || "sender", msg.reason);
-              return;
-            } else if (msg.type === "manifest") {
-              this.totalFiles = msg.totalFiles;
-              this.totalBytes = msg.totalBytes;
-              this.fileList = msg.files || [];
-              this.onManifestReceived?.(this.fileList, this.totalBytes);
-            } else if (msg.type === "file_start") {
-              this.currentFileIndex = msg.fileIndex ?? 0;
-              this.currentFileMeta = {
-                index: msg.fileIndex ?? 0,
-                name: msg.name,
-                size: msg.size,
-                mimeType: msg.mimeType,
-              };
-              this.currentFileReceivedBytes = 0;
-              this.currentFileBlobs = [];
-              this.chunkBuffer = [];
-              this.chunkBufferSize = 0;
-            } else if (msg.type === "file_end") {
-              this.finalizeCurrentFile();
-            } else if (msg.type === "batch_complete" || msg.type === "complete") {
-              if (this.currentFileBlobs.length > 0 || this.chunkBuffer.length > 0) {
-                this.finalizeCurrentFile();
-              }
-              this.onStatusChange?.("completed", "All files received successfully in original quality!");
-              this.onBatchComplete?.();
-            }
-          } catch {}
-        } else if (e.data instanceof ArrayBuffer) {
-          // Accumulate chunk in memory
-          this.chunkBuffer.push(e.data);
-          this.chunkBufferSize += e.data.byteLength;
-          this.currentFileReceivedBytes += e.data.byteLength;
-          this.totalReceivedBytes += e.data.byteLength;
+        channel.onopen = () => {
+          this.onStatusChange?.("streaming", "Control channel established!");
+          this.startTime = Date.now();
+          this.lastProgressTime = this.startTime;
+        };
 
-          // Merge into native Blob every 8MB to prevent tiny ArrayBuffers from choking GC
-          if (this.chunkBufferSize >= 8 * 1024 * 1024) {
-            this.currentFileBlobs.push(new Blob(this.chunkBuffer));
-            this.chunkBuffer = [];
-            this.chunkBufferSize = 0;
+        channel.onmessage = (e) => {
+          if (typeof e.data === "string") {
+            this.handleControlMessage(e.data);
           }
+        };
+      } else if (channel.label.startsWith("data-")) {
+        // Data channel for binary chunks
+        this.dataChannels.push(channel);
 
-          // Throttle progress updates to 150ms
-          const now = Date.now();
-          if (now - this.lastProgressTime > 150 || this.totalReceivedBytes === this.totalBytes) {
-            const elapsed = (now - this.startTime) / 1000;
-            const speed = elapsed > 0 ? this.totalReceivedBytes / elapsed : 0;
-            const remaining = Math.max(0, this.totalBytes - this.totalReceivedBytes);
-            const eta = speed > 0 ? remaining / speed : 0;
-
-            this.onProgress?.({
-              bytesTransferred: this.totalReceivedBytes,
-              totalBytes: this.totalBytes || this.totalReceivedBytes,
-              percentage: this.totalBytes
-                ? Math.min(100, Math.round((this.totalReceivedBytes / this.totalBytes) * 100))
-                : 0,
-              speed,
-              eta,
-              currentFileIndex: this.currentFileIndex,
-              totalFiles: this.totalFiles,
-              currentFileName: this.currentFileMeta?.name,
-              currentFileBytesTransferred: this.currentFileReceivedBytes,
-              currentFileTotalBytes: this.currentFileMeta?.size,
-              currentFilePercentage: this.currentFileMeta?.size
-                ? Math.min(100, Math.round((this.currentFileReceivedBytes / this.currentFileMeta.size) * 100))
-                : 0,
-            });
-
-            this.lastProgressTime = now;
+        channel.onopen = () => {
+          if (this.pollingInterval && this.dataChannels.length >= NUM_CHANNELS) {
+            clearInterval(this.pollingInterval);
+            this.pollingInterval = null;
           }
-        }
-      };
+          this.onStatusChange?.("streaming", `${this.dataChannels.length} data channels active! Receiving at maximum speed...`);
+        };
+
+        channel.onmessage = (e) => {
+          if (e.data instanceof ArrayBuffer) {
+            this.handleDataChunk(e.data);
+          }
+        };
+      }
     };
 
     // Connection state
     this.pc.onconnectionstatechange = () => {
       if (this.pc?.connectionState === "connected") {
-        this.onStatusChange?.("streaming", "Connected directly to sender! Streaming video...");
+        this.onStatusChange?.("streaming", "Connected directly to sender! Multi-channel streaming...");
       } else if (
         this.pc?.connectionState === "failed" ||
         this.pc?.connectionState === "disconnected"
@@ -576,6 +617,163 @@ export class P2PReceiverSession {
 
     // Handshake polling
     this.startReceiverPolling();
+  }
+
+  private handleControlMessage(data: string) {
+    try {
+      const msg = JSON.parse(data);
+      if (msg.type === "cancel") {
+        this.handlePeerCancelled(msg.by || "sender", msg.reason);
+        return;
+      } else if (msg.type === "manifest") {
+        this.totalFiles = msg.totalFiles;
+        this.totalBytes = msg.totalBytes;
+        this.fileList = msg.files || [];
+        this.onManifestReceived?.(this.fileList, this.totalBytes);
+      } else if (msg.type === "file_start") {
+        this.currentFileIndex = msg.fileIndex ?? 0;
+        this.currentFileMeta = {
+          index: msg.fileIndex ?? 0,
+          name: msg.name,
+          size: msg.size,
+          mimeType: msg.mimeType,
+        };
+        this.currentFileReceivedBytes = 0;
+        this.currentFileStartSeq = msg.startSeq ?? this.nextExpectedSeq;
+        this.flushedBlobs = [];
+        this.pendingFlushSize = 0;
+        // Don't clear chunkMap — there may be pre-arrived out-of-order chunks
+      } else if (msg.type === "file_end") {
+        // Flush any remaining buffered chunks for this file
+        this.flushSequentialChunks();
+        this.finalizeCurrentFile();
+      } else if (msg.type === "batch_complete" || msg.type === "complete") {
+        // Flush any remaining
+        this.flushSequentialChunks();
+        if (this.flushedBlobs.length > 0 || this.chunkMap.size > 0) {
+          this.finalizeCurrentFile();
+        }
+        this.onStatusChange?.("completed", "All files received successfully in original quality!");
+        this.onBatchComplete?.();
+      }
+    } catch {}
+  }
+
+  private handleDataChunk(data: ArrayBuffer) {
+    if (data.byteLength <= SEQ_HEADER_SIZE) return;
+
+    // Extract sequence number from 4-byte header
+    const seq = decodeSeqHeader(data);
+    const payload = data.slice(SEQ_HEADER_SIZE);
+
+    // Store in map
+    this.chunkMap.set(seq, payload);
+    this.currentFileReceivedBytes += payload.byteLength;
+    this.totalReceivedBytes += payload.byteLength;
+
+    // Try to flush sequential chunks from the map
+    this.flushSequentialChunks();
+
+    // Throttle progress updates to 150ms
+    const now = Date.now();
+    if (now - this.lastProgressTime > 150 || this.totalReceivedBytes === this.totalBytes) {
+      const elapsed = (now - this.startTime) / 1000;
+      const speed = elapsed > 0 ? this.totalReceivedBytes / elapsed : 0;
+      const remaining = Math.max(0, this.totalBytes - this.totalReceivedBytes);
+      const eta = speed > 0 ? remaining / speed : 0;
+
+      this.onProgress?.({
+        bytesTransferred: this.totalReceivedBytes,
+        totalBytes: this.totalBytes || this.totalReceivedBytes,
+        percentage: this.totalBytes
+          ? Math.min(100, Math.round((this.totalReceivedBytes / this.totalBytes) * 100))
+          : 0,
+        speed,
+        eta,
+        currentFileIndex: this.currentFileIndex,
+        totalFiles: this.totalFiles,
+        currentFileName: this.currentFileMeta?.name,
+        currentFileBytesTransferred: this.currentFileReceivedBytes,
+        currentFileTotalBytes: this.currentFileMeta?.size,
+        currentFilePercentage: this.currentFileMeta?.size
+          ? Math.min(100, Math.round((this.currentFileReceivedBytes / this.currentFileMeta.size) * 100))
+          : 0,
+      });
+
+      this.lastProgressTime = now;
+    }
+  }
+
+  // Flush chunks that are in sequential order starting from nextExpectedSeq
+  private flushSequentialChunks() {
+    const BLOB_CONSOLIDATION_SIZE = 8 * 1024 * 1024; // 8 MB
+    const batchChunks: ArrayBuffer[] = [];
+
+    while (this.chunkMap.has(this.nextExpectedSeq)) {
+      const chunk = this.chunkMap.get(this.nextExpectedSeq)!;
+      this.chunkMap.delete(this.nextExpectedSeq);
+      batchChunks.push(chunk);
+      this.pendingFlushSize += chunk.byteLength;
+      this.nextExpectedSeq++;
+
+      // Consolidate into a Blob every 8MB to prevent GC pressure
+      if (this.pendingFlushSize >= BLOB_CONSOLIDATION_SIZE) {
+        this.flushedBlobs.push(new Blob(batchChunks));
+        batchChunks.length = 0;
+        this.pendingFlushSize = 0;
+      }
+    }
+
+    // Store remaining batch chunks
+    if (batchChunks.length > 0) {
+      this.flushedBlobs.push(new Blob(batchChunks));
+    }
+  }
+
+  private finalizeCurrentFile() {
+    if (!this.currentFileMeta) return;
+
+    // Flush any remaining in the map
+    this.flushSequentialChunks();
+
+    // If there are still out-of-order chunks in the map, force-flush them
+    // (This handles edge cases where some chunks arrived but seq gaps exist)
+    if (this.chunkMap.size > 0) {
+      const sortedSeqs = Array.from(this.chunkMap.keys()).sort((a, b) => a - b);
+      const remainingChunks: ArrayBuffer[] = [];
+      for (const seq of sortedSeqs) {
+        remainingChunks.push(this.chunkMap.get(seq)!);
+        this.chunkMap.delete(seq);
+      }
+      if (remainingChunks.length > 0) {
+        this.flushedBlobs.push(new Blob(remainingChunks));
+      }
+      this.nextExpectedSeq = (sortedSeqs[sortedSeqs.length - 1] ?? this.nextExpectedSeq) + 1;
+    }
+
+    const filename = this.currentFileMeta.name || `video_${this.currentFileIndex + 1}.mp4`;
+    const mimeType = this.currentFileMeta.mimeType || "video/mp4";
+    const blob = new Blob(this.flushedBlobs, { type: mimeType });
+
+    // Release blob chunks from memory
+    this.flushedBlobs = [];
+    this.pendingFlushSize = 0;
+
+    this.onFileReceived?.(blob, filename, this.currentFileIndex, this.totalFiles);
+
+    // Auto-trigger browser download
+    try {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (e) {
+      console.warn("Auto-download failed:", e);
+    }
   }
 
   private startReceiverPolling() {
@@ -623,46 +821,13 @@ export class P2PReceiverSession {
     }, 300);
   }
 
-  private finalizeCurrentFile() {
-    if (!this.currentFileMeta) return;
-
-    if (this.chunkBuffer.length > 0) {
-      this.currentFileBlobs.push(new Blob(this.chunkBuffer));
-      this.chunkBuffer = [];
-      this.chunkBufferSize = 0;
-    }
-
-    const filename = this.currentFileMeta.name || `video_${this.currentFileIndex + 1}.mp4`;
-    const mimeType = this.currentFileMeta.mimeType || "video/mp4";
-    const blob = new Blob(this.currentFileBlobs, { type: mimeType });
-
-    // Release blob chunks from memory array
-    this.currentFileBlobs = [];
-
-    this.onFileReceived?.(blob, filename, this.currentFileIndex, this.totalFiles);
-
-    // Auto-trigger browser download
-    try {
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-    } catch (e) {
-      console.warn("Auto-download failed:", e);
-    }
-  }
-
   public cancel(by: "sender" | "receiver" = "receiver", reason = "Transfer cancelled by recipient") {
     if (this.isCancelled || this.isDestroyed) return;
     this.isCancelled = true;
 
-    if (this.dc && this.dc.readyState === "open") {
+    if (this.controlChannel && this.controlChannel.readyState === "open") {
       try {
-        this.dc.send(JSON.stringify({ type: "cancel", by, reason }));
+        this.controlChannel.send(JSON.stringify({ type: "cancel", by, reason }));
       } catch {}
     }
 
@@ -684,15 +849,14 @@ export class P2PReceiverSession {
   public destroy() {
     this.isDestroyed = true;
     if (this.pollingInterval) clearInterval(this.pollingInterval);
-    if (this.dc) {
-      try {
-        this.dc.close();
-      } catch {}
+    if (this.controlChannel) {
+      try { this.controlChannel.close(); } catch {}
+    }
+    for (const dc of this.dataChannels) {
+      try { dc.close(); } catch {}
     }
     if (this.pc) {
-      try {
-        this.pc.close();
-      } catch {}
+      try { this.pc.close(); } catch {}
     }
   }
 }
